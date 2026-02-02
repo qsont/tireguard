@@ -141,6 +141,8 @@ class VideoWidget(QLabel):
         self.calib_mode = False
         self.calib_points = []
 
+        self._resize_mode = False
+
     def set_modes(self, roi_mode=False, calib_mode=False):
         self.roi_mode = roi_mode
         self.calib_mode = calib_mode
@@ -149,6 +151,7 @@ class VideoWidget(QLabel):
         self.dragging = False
         self.drag_start = None
         self.drag_end = None
+        self._resize_mode = False
         self.update()
 
     def set_frame(self, frame_bgr, roi=None):
@@ -171,6 +174,7 @@ class VideoWidget(QLabel):
             return
         if not self.roi_mode:
             return
+        self._resize_mode = bool(e.modifiers() & Qt.ShiftModifier)
         self.dragging = True
         self.drag_start = (e.position().x(), e.position().y())
         self.drag_end = self.drag_start
@@ -188,9 +192,10 @@ class VideoWidget(QLabel):
         self.dragging = False
         self.drag_end = (e.position().x(), e.position().y())
         self.update()
-        w = self.window();
+        w = self.window()
         if hasattr(w, 'on_roi_drag_finished'):
             w.on_roi_drag_finished()
+        self._resize_mode = False
 
     def _widget_to_frame(self, x, y):
         if self.frame_bgr is None:
@@ -287,6 +292,11 @@ class MainWindow(QMainWindow):
         self.auto_trigger_enabled = False
         self.stable_ok_frames = 0
         self._metrics_last_t = 0.0
+
+        # Auto-trigger safety
+        self._auto_last_capture_t = 0.0
+        self._auto_cooldown_s = 2.0
+        self._capture_busy = False
 
         self.toast = Toast(self)
 
@@ -534,6 +544,10 @@ class MainWindow(QMainWindow):
 
         v.addWidget(self._card("ROI Tools", btns))
 
+        self.roi_info = QLabel("ROI: not set")
+        self.roi_info.setStyleSheet("color: rgba(232,247,255,0.75); font-weight:700;")
+        v.addWidget(self.roi_info)
+
         tip = QLabel("Tip: drag a rectangle around the tire tread. Keep it tight.")
         tip.setStyleSheet("color: rgba(232,247,255,0.65);")
         v.addWidget(tip)
@@ -662,6 +676,13 @@ class MainWindow(QMainWindow):
         self.history = QListWidget()
         self.history.itemSelectionChanged.connect(self.on_history_select)
         hv.addWidget(self.history)
+
+        self.hist_preview = QLabel("Preview")
+        self.hist_preview.setMinimumHeight(180)
+        self.hist_preview.setAlignment(Qt.AlignCenter)
+        self.hist_preview.setStyleSheet("background:#0b0f14; border-radius:14px; border:1px solid rgba(120,220,255,0.18);")
+        hv.addWidget(self.hist_preview)
+
         hist.setLayout(hv)
 
         v.addWidget(thr)
@@ -763,6 +784,13 @@ class MainWindow(QMainWindow):
                         need = self.sp_stable_need.value() if hasattr(self, 'sp_stable_need') else 8
                         if self.stable_ok_frames >= need:
                             self.stable_ok_frames = 0
+                            now = time.monotonic()
+                            if self._capture_busy:
+                                return
+                            if (now - self._auto_last_capture_t) < self._auto_cooldown_s:
+                                return
+
+                            self._auto_last_capture_t = now
                             self.toast.show_toast("Auto-trigger capture…")
                             self.capture_analyze()
                 except Exception:
@@ -770,6 +798,23 @@ class MainWindow(QMainWindow):
                     pass
 
     # ---------- ROI ----------
+    def _update_roi_info(self):
+        if not hasattr(self, "roi_info"):
+            return
+        if not self.roi:
+            self.roi_info.setText("ROI: not set")
+            return
+
+        w = int(self.roi["w"])
+        h = int(self.roi["h"])
+        msg = f"ROI: {w} × {h} px"
+
+        mm_per_px = self.calib.get("mm_per_px") if self.calib else None
+        if mm_per_px:
+            msg += f"  |  {w * mm_per_px:.1f} × {h * mm_per_px:.1f} mm"
+
+        self.roi_info.setText(msg)
+
     def toggle_roi_mode(self):
         self.video.set_modes(roi_mode=True, calib_mode=False)
         self.toast.show_toast("ROI mode: drag a rectangle on the video")
@@ -777,6 +822,7 @@ class MainWindow(QMainWindow):
     def clear_roi(self):
         self.roi = None
         self.video.roi = None
+        self._update_roi_info()
         self.toast.show_toast("ROI cleared")
 
     def auto_roi(self):
@@ -784,6 +830,7 @@ class MainWindow(QMainWindow):
             return
         self.roi = clamp_roi(suggest_roi(self.video.frame_bgr), self.video.frame_bgr.shape)
         self.video.set_frame(self.video.frame_bgr, roi=self.roi)
+        self._update_roi_info()
         self.toast.show_toast("Auto ROI set")
 
     def on_roi_drag_finished(self):
@@ -793,13 +840,25 @@ class MainWindow(QMainWindow):
         x1, y1 = self.video.drag_end
         fx0, fy0 = self.video._widget_to_frame(x0, y0)
         fx1, fy1 = self.video._widget_to_frame(x1, y1)
-        x = min(fx0, fx1); y = min(fy0, fy1)
-        w = abs(fx1 - fx0); h = abs(fy1 - fy0)
+
+        resize = getattr(self.video, "_resize_mode", False)
+        if resize and self.roi:
+            x = int(self.roi["x"])
+            y = int(self.roi["y"])
+            w = abs(fx1 - x)
+            h = abs(fy1 - y)
+        else:
+            x = min(fx0, fx1)
+            y = min(fy0, fy1)
+            w = abs(fx1 - fx0)
+            h = abs(fy1 - fy0)
+
         if w < 40 or h < 40:
             self.toast.show_toast("ROI too small. Try again.")
             return
         self.roi = clamp_roi({"x": x, "y": y, "w": w, "h": h}, self.video.frame_bgr.shape)
         self.video.set_modes(False, False)
+        self._update_roi_info()
         self.toast.show_toast(f"ROI set ({w}×{h})")
 
     # ---------- Calibration ----------
@@ -843,168 +902,179 @@ class MainWindow(QMainWindow):
 
     # ---------- Capture ----------
     def capture_analyze(self):
-        if self.video.frame_bgr is None:
-            self.toast.show_toast("No camera frame.")
+        if self._capture_busy:
             return
-        if not self.roi:
-            self.toast.show_toast("Set ROI first.")
-            return
-
-        # Burst capture for reliability
-        burst_n = self.sp_burst.value() if hasattr(self, 'sp_burst') else 1
-        frames = []
-        if burst_n <= 1:
-            frame = self.video.frame_bgr.copy()
-            frames = [frame]
-        else:
-            # grab burst_n frames from camera (fallback to last frame if needed)
-            for _ in range(burst_n):
-                ok, fr = self.cap.read() if self.cap else (False, None)
-                if ok and fr is not None:
-                    frames.append(fr)
-            if not frames:
-                frames = [self.video.frame_bgr.copy()]
-            # pick best frame by quality: sharpness high, glare low
-            best = frames[0]
-            best_score = -1e18
-            prevg = None
-            for fr in frames:
-                try:
-                    roi_bgr_tmp = crop_roi(fr, self.roi)
-                    live, g = compute_live_metrics(
-                        roi_bgr_tmp, prevg,
-                        min_brightness=self.cfg.min_brightness,
-                        max_brightness=self.cfg.max_brightness,
-                        min_sharpness=self.cfg.min_sharpness,
-                    )
-                    prevg = g
-                    # heuristic score: prefer sharpness, penalize glare + instability
-                    score = (live.sharpness * 1.0) - (live.glare_ratio * 800.0) - (live.stability * 25.0)
-                    if score > best_score:
-                        best_score = score
-                        best = fr
-                except Exception:
-                    continue
-            frame = best.copy()
-        roi_bgr = crop_roi(frame, self.roi)
-
-        # --- normalize CLAHE config safely (handles int/list/tuple/None) ---
-        grid = getattr(self.cfg, "clahe_grid", (8, 8))
-        if isinstance(grid, int):
-            grid = (grid, grid)
-        elif isinstance(grid, (list, tuple)) and len(grid) == 2:
-            grid = (int(grid[0]), int(grid[1]))
-        else:
-            grid = (8, 8)
-
-        clip = getattr(self.cfg, "clahe_clip", 2.0)
+        self._capture_busy = True
         try:
-            clip = float(clip)
-        except Exception:
-            clip = 2.0
+            if self.video.frame_bgr is None:
+                self.toast.show_toast("No camera frame.")
+                return
+            if not self.roi:
+                self.toast.show_toast("Set ROI first.")
+                return
 
-        processed = preprocess_bgr(roi_bgr, clahe_clip=clip, clahe_grid=grid)
+            # Burst capture for reliability
+            burst_n = self.sp_burst.value() if hasattr(self, 'sp_burst') else 1
+            frames = []
+            if burst_n <= 1:
+                frame = self.video.frame_bgr.copy()
+                frames = [frame]
+            else:
+                # grab burst_n frames from camera (fallback to last frame if needed)
+                for _ in range(burst_n):
+                    ok, fr = self.cap.read() if self.cap else (False, None)
+                    if ok and fr is not None:
+                        frames.append(fr)
+                if not frames:
+                    frames = [self.video.frame_bgr.copy()]
+                # pick best frame by quality: sharpness high, glare low
+                best = frames[0]
+                best_score = -1e18
+                prevg = None
+                for fr in frames:
+                    try:
+                        roi_bgr_tmp = crop_roi(fr, self.roi)
+                        live, g = compute_live_metrics(
+                            roi_bgr_tmp, prevg,
+                            min_brightness=self.cfg.min_brightness,
+                            max_brightness=self.cfg.max_brightness,
+                            min_sharpness=self.cfg.min_sharpness,
+                        )
+                        prevg = g
+                        # heuristic score: prefer sharpness, penalize glare + instability
+                        score = (live.sharpness * 1.0) - (live.glare_ratio * 800.0) - (live.stability * 25.0)
+                        if score > best_score:
+                            best_score = score
+                            best = fr
+                    except Exception:
+                        continue
+                frame = best.copy()
+            roi_bgr = crop_roi(frame, self.roi)
 
-        # --- required outputs ---
-        gray = processed.get("gray")
-        if gray is None:
-            self.toast.show_toast("Preprocess failed: missing gray output.")
-            return
+            # --- normalize CLAHE config safely (handles int/list/tuple/None) ---
+            grid = getattr(self.cfg, "clahe_grid", (8, 8))
+            if isinstance(grid, int):
+                grid = (grid, grid)
+            elif isinstance(grid, (list, tuple)) and len(grid) == 2:
+                grid = (int(grid[0]), int(grid[1]))
+            else:
+                grid = (8, 8)
 
-        q = run_quality_checks(gray, self.cfg)
+            clip = getattr(self.cfg, "clahe_clip", 2.0)
+            try:
+                clip = float(clip)
+            except Exception:
+                clip = 2.0
 
-        # --- edges_closed is optional; fallback to edges ---
-        edges_for_measure = processed.get("edges_closed", None)
-        if edges_for_measure is None:
-            edges_for_measure = processed.get("edges", None)
-        if edges_for_measure is None:
-            self.toast.show_toast("No edges found; check preprocess.")
-            return
+            processed = preprocess_bgr(roi_bgr, clahe_clip=clip, clahe_grid=grid)
 
-        m = groove_visibility_score(edges_for_measure)
-        verdict = pass_fail_from_score(m["score"])
+            # --- required outputs ---
+            gray = processed.get("gray")
+            if gray is None:
+                self.toast.show_toast("Preprocess failed: missing gray output.")
+                return
 
-        # chip state
-        if q["ok"] and verdict.upper().startswith("PASS"):
-            self.chip.set_state("ok", "OK")
-        elif not q["ok"] and verdict.upper().startswith("PASS"):
-            self.chip.set_state("warn", "WARN")
-        else:
-            self.chip.set_state("fail", "FAIL")
+            q = run_quality_checks(gray, self.cfg)
 
-        meta = {
-            "camera_index": self.cam_index,
-            "roi": self.roi,
-            "quality": q,
-            "measure": m,
-            "verdict": verdict,
-            "session": {
+            # --- edges_closed is optional; fallback to edges ---
+            edges_for_measure = processed.get("edges_closed", None)
+            if edges_for_measure is None:
+                edges_for_measure = processed.get("edges", None)
+            if edges_for_measure is None:
+                self.toast.show_toast("No edges found; check preprocess.")
+                return
+
+            m = groove_visibility_score(edges_for_measure)
+            verdict = pass_fail_from_score(m["score"])
+
+            # chip state
+            if q["ok"] and verdict.upper().startswith("PASS"):
+                self.chip.set_state("ok", "OK")
+            elif not q["ok"] and verdict.upper().startswith("PASS"):
+                self.chip.set_state("warn", "WARN")
+            else:
+                self.chip.set_state("fail", "FAIL")
+
+            meta = {
+                "camera_index": self.cam_index,
+                "roi": self.roi,
+                "quality": q,
+                "measure": m,
+                "verdict": verdict,
+                "session": {
+                    "vehicle_id": self.in_vehicle.text().strip() or None,
+                    "tire_position": self.in_tirepos.currentText(),
+                    "operator": self.in_operator.text().strip() or None,
+                    "notes": self.in_notes.text().strip() or None,
+                },
+                "calibration": self.calib,
+                "config": asdict(self.cfg),
+            }
+
+            ts, img_path, meta_path = save_capture(self.cfg, frame, meta)
+            out_paths = save_processed(self.cfg, ts, processed)
+
+            insert_result(self.cfg, {
+                "ts": ts,
+                "image_path": str(img_path),
+                "roi_x": int(self.roi["x"]), "roi_y": int(self.roi["y"]),
+                "roi_w": int(self.roi["w"]), "roi_h": int(self.roi["h"]),
+                "brightness": float(q["metrics"]["brightness"]),
+                "glare_ratio": float(q["metrics"]["glare_ratio"]),
+                "sharpness": float(q["metrics"]["sharpness"]),
+                "edge_density": float(m["edge_density"]),
+                "continuity": float(m["continuity"]),
+                "score": float(m["score"]),
+                "verdict": verdict,
+                "notes": "; ".join(q["reasons"]) if not q["ok"] else "",
                 "vehicle_id": self.in_vehicle.text().strip() or None,
                 "tire_position": self.in_tirepos.currentText(),
                 "operator": self.in_operator.text().strip() or None,
-                "notes": self.in_notes.text().strip() or None,
-            },
-            "calibration": self.calib,
-            "config": asdict(self.cfg),
-        }
+                "session_notes": self.in_notes.text().strip() or None,
+                "mm_per_px": float(self.calib["mm_per_px"]) if self.calib.get("mm_per_px") else None
+            })
 
-        ts, img_path, meta_path = save_capture(self.cfg, frame, meta)
-        out_paths = save_processed(self.cfg, ts, processed)
+            # clean readable result
+            self.result.clear()
+            self.result.append(f"<h3 style='margin:0;'>Verdict: {verdict}</h3>")
+            self.result.append(f"<b>Score:</b> {m['score']:.4f}")
+            self.result.append(f"<b>Quality:</b> {'OK' if q['ok'] else 'FAIL'}")
+            if q["reasons"]:
+                self.result.append("<b>Issues:</b>")
+                for r in q["reasons"]:
+                    self.result.append(f"• {r}")
+            if self.calib.get("mm_per_px"):
+                self.result.append(f"<b>Scale:</b> {self.calib['mm_per_px']:.6f} mm/px")
 
-        insert_result(self.cfg, {
-            "ts": ts,
-            "image_path": str(img_path),
-            "roi_x": int(self.roi["x"]), "roi_y": int(self.roi["y"]),
-            "roi_w": int(self.roi["w"]), "roi_h": int(self.roi["h"]),
-            "brightness": float(q["metrics"]["brightness"]),
-            "glare_ratio": float(q["metrics"]["glare_ratio"]),
-            "sharpness": float(q["metrics"]["sharpness"]),
-            "edge_density": float(m["edge_density"]),
-            "continuity": float(m["continuity"]),
-            "score": float(m["score"]),
-            "verdict": verdict,
-            "notes": "; ".join(q["reasons"]) if not q["ok"] else "",
-            "vehicle_id": self.in_vehicle.text().strip() or None,
-            "tire_position": self.in_tirepos.currentText(),
-            "operator": self.in_operator.text().strip() or None,
-            "session_notes": self.in_notes.text().strip() or None,
-            "mm_per_px": float(self.calib["mm_per_px"]) if self.calib.get("mm_per_px") else None
-        })
-
-        # clean readable result
-        self.result.clear()
-        self.result.append(f"<h3 style='margin:0;'>Verdict: {verdict}</h3>")
-        self.result.append(f"<b>Score:</b> {m['score']:.4f}")
-        self.result.append(f"<b>Quality:</b> {'OK' if q['ok'] else 'FAIL'}")
-        if q["reasons"]:
-            self.result.append("<b>Issues:</b>")
-            for r in q["reasons"]:
-                self.result.append(f"• {r}")
-        if self.calib.get("mm_per_px"):
-            self.result.append(f"<b>Scale:</b> {self.calib['mm_per_px']:.6f} mm/px")
-
-        self.toast.show_toast(f"Saved scan {ts}")
-        self._refresh_history()
-
+            self.toast.show_toast(f"Saved scan {ts}")
+            self._refresh_history()
+        except Exception as e:
+            self.toast.show_toast(f"Capture failed: {e}")
+            self.chip.set_state("fail", "FAIL")
+            raise
+        finally:
+            self._capture_busy = False
+    # implementation on auto trigger
     def _on_auto_trigger_changed(self, text):
-        self.auto_trigger_enabled = (text.lower() == "on")
+        self.auto_trigger_enabled = (text.strip().lower() == "on")
         self.stable_ok_frames = 0
-        self.toast.show_toast("Auto-trigger enabled" if self.auto_trigger_enabled else "Auto-trigger disabled")
-
+        self.toast.show_toast("Auto-trigger ON" if self.auto_trigger_enabled else "Auto-trigger OFF")
+    # export for csv action
     def export_csv_action(self):
         p = export_csv(self.cfg)
-        self.toast.show_toast("CSV exported ✔")
-        QMessageBox.information(self, "Export", f"Exported CSV:\n{p}")
+        QMessageBox.information(self, "Export CSV", f"Exported: {p}")
 
-    # ---------- History ----------
+    # _refresh-his
     def _refresh_history(self):
-        if not self.adv_dock.isVisible():
+        if not hasattr(self, "history"):
             return
+        self.history.blockSignals(True)
         self.history.clear()
-        items = list_results(self.cfg, limit=40)
+        items = list_results(self.cfg, limit=30)
         for it in items:
             self.history.addItem(f"{it['ts']} | {it['verdict']} | {it['score']:.4f}")
-
+        self.history.blockSignals(False)
+    # ---------- History ----------
     def on_history_select(self):
         if not self.history.selectedItems():
             return
@@ -1012,13 +1082,20 @@ class MainWindow(QMainWindow):
         row = get_result_by_ts(self.cfg, ts)
         if not row:
             return
-        self.result.clear()
-        self.result.append(f"<b>Loaded:</b> {ts}")
-        self.result.append(f"Verdict: {row['verdict']} | Score: {row['score']:.4f}")
-        if row.get("mm_per_px"):
-            self.result.append(f"Scale: {row['mm_per_px']:.6f} mm/px")
-        if row.get("session_notes"):
-            self.result.append(f"Notes: {row['session_notes']}")
+
+        paths = find_processed_images(self.cfg, ts)
+        candidate = None
+        for key in ("gray", "edges_closed", "edges"):
+            if key in paths:
+                candidate = paths[key]
+                break
+
+        if candidate:
+            img = cv2.imread(str(candidate))
+            if img is not None:
+                qimg = bgr_to_qimage(img)
+                pix = QPixmap.fromImage(qimg).scaled(self.hist_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+                self.hist_preview.setPixmap(pix)
 
     # ---------- Advanced ----------
     def toggle_advanced(self):

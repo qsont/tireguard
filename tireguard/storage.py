@@ -184,12 +184,18 @@ def find_processed_images(cfg, ts: str):
 def export_csv(cfg):
     import csv
     con = sqlite3.connect(cfg.db_path)
+    con.row_factory = sqlite3.Row
     cur = con.cursor()
-    cur.execute("""
-        SELECT ts,image_path,roi_x,roi_y,roi_w,roi_h,
-               brightness,glare_ratio,sharpness,
-               edge_density,continuity,score,verdict,notes,
-               vehicle_id,tire_position,operator,session_notes,mm_per_px
+
+    COLUMNS = [
+        "ts","image_path","vehicle_id","tire_position","operator","session_notes",
+        "brightness","glare_ratio","sharpness",
+        "edge_density","continuity","score","verdict",
+        "mm_per_px","notes"
+    ]
+
+    cur.execute(f"""
+        SELECT {", ".join(COLUMNS)}
         FROM results
         ORDER BY id DESC
     """)
@@ -199,12 +205,8 @@ def export_csv(cfg):
     cfg.export_csv_path.parent.mkdir(parents=True, exist_ok=True)
     with open(cfg.export_csv_path, "w", newline="") as f:
         w = csv.writer(f)
-        w.writerow([
-            "ts","image_path","roi_x","roi_y","roi_w","roi_h",
-            "brightness","glare_ratio","sharpness",
-            "edge_density","continuity","score","verdict","notes",
-            "vehicle_id","tire_position","operator","session_notes","mm_per_px"
-        ])
-        w.writerows(rows)
+        w.writerow(COLUMNS)
+        for r in rows:
+            w.writerow([r.get(c, "") if r.get(c, None) is not None else "" for c in COLUMNS])
 
     return cfg.export_csv_path
