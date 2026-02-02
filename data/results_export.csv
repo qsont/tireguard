@@ -1,1 +1,2 @@
-ts,image_path,roi_x,roi_y,roi_w,roi_h,brightness,glare_ratio,sharpness,edge_density,continuity,score,verdict,notes
+ts,image_path,roi_x,roi_y,roi_w,roi_h,brightness,glare_ratio,sharpness,edge_density,continuity,score,verdict,notes,vehicle_id,tire_position,operator,session_notes,mm_per_px
+20260129_232713,data/captures/tire_20260129_232713.jpg,64,208,288,216,57.788226594650205,0.004034850823045268,33.019264385668684,0.020817258230452676,431.6666666666667,0.06782773531923325,REPLACE,Too blurry (sharpness=33.0),,FL,,,0.02874964197934395

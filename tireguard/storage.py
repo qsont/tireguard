@@ -8,14 +8,42 @@ def ensure_dirs(cfg):
     cfg.data_dir.mkdir(parents=True, exist_ok=True)
     cfg.captures_dir.mkdir(parents=True, exist_ok=True)
     cfg.processed_dir.mkdir(parents=True, exist_ok=True)
+def _json_safe(o):
+    """Recursively convert objects (Path, numpy types, dataclasses) to JSON-safe primitives."""
+    from pathlib import Path
+    try:
+        import numpy as np
+        numpy_types = (np.integer, np.floating, np.bool_)
+    except Exception:
+        numpy_types = ()
+
+    if o is None:
+        return None
+    if isinstance(o, Path):
+        return str(o)
+    if numpy_types and isinstance(o, numpy_types):
+        return o.item()
+    if isinstance(o, (str, int, float, bool)):
+        return o
+    if isinstance(o, dict):
+        return {str(k): _json_safe(v) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_json_safe(v) for v in o]
+    # fallback: string representation (last resort)
+    return str(o)
 
 def now_ts():
     return datetime.now().strftime("%Y%m%d_%H%M%S")
+
+def _col_exists(cur, table, col):
+    cur.execute(f"PRAGMA table_info({table})")
+    return any(r[1] == col for r in cur.fetchall())
 
 def init_db(cfg):
     ensure_dirs(cfg)
     con = sqlite3.connect(cfg.db_path)
     cur = con.cursor()
+
     cur.execute("""
     CREATE TABLE IF NOT EXISTS results (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -35,6 +63,19 @@ def init_db(cfg):
         notes TEXT
     )
     """)
+
+    # --- lightweight migrations for new thesis workflow fields ---
+    migrations = [
+        ("vehicle_id", "TEXT"),
+        ("tire_position", "TEXT"),
+        ("operator", "TEXT"),
+        ("session_notes", "TEXT"),
+        ("mm_per_px", "REAL"),
+    ]
+    for col, typ in migrations:
+        if not _col_exists(cur, "results", col):
+            cur.execute(f"ALTER TABLE results ADD COLUMN {col} {typ}")
+
     con.commit()
     con.close()
 
@@ -44,7 +85,7 @@ def save_capture(cfg, frame_bgr, meta: dict):
     img_path = cfg.captures_dir / f"tire_{ts}.jpg"
     meta_path = cfg.captures_dir / f"tire_{ts}.json"
     cv2.imwrite(str(img_path), frame_bgr)
-    meta_path.write_text(json.dumps({"ts": ts, **meta}, indent=2))
+    meta_path.write_text(json.dumps({"ts": ts, **meta}, indent=2, default=str), encoding='utf-8')
     return ts, img_path, meta_path
 
 def save_processed(cfg, ts: str, processed: dict):
@@ -57,21 +98,42 @@ def save_processed(cfg, ts: str, processed: dict):
     return out_paths
 
 def insert_result(cfg, row: dict):
-    con = sqlite3.connect(cfg.db_path)
+    """
+    Insert a row into results table.
+    Robust: builds column list + placeholders from the provided dict keys.
+    This prevents 'N values for M columns' mismatches when schema evolves.
+    """
+    import sqlite3
+    from pathlib import Path
+
+    db_path = getattr(cfg, "db_path", None) or getattr(cfg, "data_dir", None)
+    if db_path is None:
+        # fallback: look for cfg.db_path attribute that your init_db() uses
+        raise RuntimeError("Config has no db_path/data_dir; cannot locate database.")
+    if not str(db_path).endswith(".db"):
+        # if cfg.data_dir is provided, assume db file is inside it as tireguard.db
+        db_path = Path(db_path) / "tireguard.db"
+    else:
+        db_path = Path(db_path)
+
+    # Keep only known columns that exist in the table (protect against stray keys)
+    con = sqlite3.connect(str(db_path))
+    con.row_factory = sqlite3.Row
     cur = con.cursor()
-    cur.execute("""
-    INSERT INTO results (
-        ts, image_path, roi_x, roi_y, roi_w, roi_h,
-        brightness, glare_ratio, sharpness,
-        edge_density, continuity, score, verdict, notes
-    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-    """, (
-        row["ts"], row["image_path"],
-        row["roi_x"], row["roi_y"], row["roi_w"], row["roi_h"],
-        row["brightness"], row["glare_ratio"], row["sharpness"],
-        row["edge_density"], row["continuity"], row["score"],
-        row["verdict"], row.get("notes","")
-    ))
+
+    cur.execute("PRAGMA table_info(results)")
+    cols_in_db = {r["name"] for r in cur.fetchall()}
+
+    clean = {k: row.get(k) for k in row.keys() if k in cols_in_db}
+    if "ts" not in clean:
+        clean["ts"] = row.get("ts")
+
+    cols = list(clean.keys())
+    vals = [clean[c] for c in cols]
+    placeholders = ", ".join(["?"] * len(cols))
+
+    sql = f"INSERT INTO results ({', '.join(cols)}) VALUES ({placeholders})"
+    cur.execute(sql, vals)
     con.commit()
     con.close()
 
@@ -94,7 +156,8 @@ def get_result_by_ts(cfg, ts: str):
     cur.execute("""
         SELECT ts,image_path,roi_x,roi_y,roi_w,roi_h,
                brightness,glare_ratio,sharpness,
-               edge_density,continuity,score,verdict,notes
+               edge_density,continuity,score,verdict,notes,
+               vehicle_id,tire_position,operator,session_notes,mm_per_px
         FROM results
         WHERE ts=?
         LIMIT 1
@@ -105,13 +168,11 @@ def get_result_by_ts(cfg, ts: str):
         return None
     keys = ["ts","image_path","roi_x","roi_y","roi_w","roi_h",
             "brightness","glare_ratio","sharpness",
-            "edge_density","continuity","score","verdict","notes"]
+            "edge_density","continuity","score","verdict","notes",
+            "vehicle_id","tire_position","operator","session_notes","mm_per_px"]
     return dict(zip(keys, row))
 
 def find_processed_images(cfg, ts: str):
-    """
-    Returns paths if present: norm, edges, edges_closed, gray
-    """
     candidates = ["norm", "edges", "edges_closed", "gray"]
     out = {}
     for k in candidates:
@@ -127,7 +188,8 @@ def export_csv(cfg):
     cur.execute("""
         SELECT ts,image_path,roi_x,roi_y,roi_w,roi_h,
                brightness,glare_ratio,sharpness,
-               edge_density,continuity,score,verdict,notes
+               edge_density,continuity,score,verdict,notes,
+               vehicle_id,tire_position,operator,session_notes,mm_per_px
         FROM results
         ORDER BY id DESC
     """)
@@ -140,7 +202,8 @@ def export_csv(cfg):
         w.writerow([
             "ts","image_path","roi_x","roi_y","roi_w","roi_h",
             "brightness","glare_ratio","sharpness",
-            "edge_density","continuity","score","verdict","notes"
+            "edge_density","continuity","score","verdict","notes",
+            "vehicle_id","tire_position","operator","session_notes","mm_per_px"
         ])
         w.writerows(rows)
 
