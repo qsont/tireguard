@@ -137,18 +137,45 @@ def insert_result(cfg, row: dict):
     con.commit()
     con.close()
 
-def list_results(cfg, limit=30):
+def list_results(cfg, limit=30, vehicle_id=None, tire_position=None, verdict=None):
     con = sqlite3.connect(cfg.db_path)
     cur = con.cursor()
-    cur.execute("""
-        SELECT ts, verdict, score, image_path
+
+    where = []
+    params = []
+
+    if vehicle_id:
+        where.append("vehicle_id = ?")
+        params.append(vehicle_id)
+    if tire_position:
+        where.append("tire_position = ?")
+        params.append(tire_position)
+    if verdict:
+        where.append("verdict = ?")
+        params.append(verdict)
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+
+    cur.execute(f"""
+        SELECT ts, verdict, score, image_path, vehicle_id, tire_position
         FROM results
+        {where_sql}
         ORDER BY id DESC
         LIMIT ?
-    """, (int(limit),))
+    """, (*params, int(limit)))
     rows = cur.fetchall()
     con.close()
-    return [{"ts": r[0], "verdict": r[1], "score": r[2], "image_path": r[3]} for r in rows]
+    return [
+        {
+            "ts": r[0],
+            "verdict": r[1],
+            "score": r[2],
+            "image_path": r[3],
+            "vehicle_id": r[4],
+            "tire_position": r[5],
+        }
+        for r in rows
+    ]
 
 def get_result_by_ts(cfg, ts: str):
     con = sqlite3.connect(cfg.db_path)
@@ -207,6 +234,7 @@ def export_csv(cfg):
         w = csv.writer(f)
         w.writerow(COLUMNS)
         for r in rows:
-            w.writerow([r.get(c, "") if r.get(c, None) is not None else "" for c in COLUMNS])
+            rd = dict(r)  # sqlite3.Row -> dict
+            w.writerow([rd.get(c, "") if rd.get(c, None) is not None else "" for c in COLUMNS])
 
     return cfg.export_csv_path
