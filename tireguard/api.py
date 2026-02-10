@@ -324,6 +324,31 @@ def index():
       background: rgba(255, 255, 255, 0.15);
     }
 
+    /* Desktop App Button - top right */
+    .app-launch-btn {
+      position: absolute;
+      top: 1.25rem;
+      right: 1.25rem;
+      background: rgba(255, 255, 255, 0.15);
+      border: 1px solid rgba(255, 255, 255, 0.3);
+      color: white;
+      padding: 0.5rem 0.75rem;
+      border-radius: 8px;
+      font-size: 0.85rem;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      transition: var(--transition);
+    }
+    .app-launch-btn:hover {
+      background: rgba(255, 255, 255, 0.25);
+      transform: translateY(-1px);
+    }
+    .app-launch-btn i {
+      font-size: 1rem;
+    }
+
     /* Main Content */
     .container {
       display: grid;
@@ -407,6 +432,8 @@ def index():
     table {
       width: 100%;
       border-collapse: collapse;
+      display: block;
+      overflow-x: auto;
     }
 
     thead {
@@ -418,6 +445,7 @@ def index():
       text-align: left;
       border-bottom: 1px solid var(--gray-200);
       font-size: 0.85rem;
+      white-space: nowrap;
     }
 
     th {
@@ -431,6 +459,21 @@ def index():
     tr:hover {
       background-color: #f8f9fa;
       cursor: pointer;
+    }
+
+    /* ✅ Fix: Add vertical scroll to Recent Scans card */
+    .card-body > table {
+      max-height: 400px;
+      overflow-y: auto;
+      display: block;
+      border-bottom: 1px solid var(--gray-200);
+    }
+
+    /* For mobile: make table scroll horizontally */
+    @media (max-width: 768px) {
+      .card-body > table {
+        max-height: 300px;
+      }
     }
 
     .verdict-badge {
@@ -669,72 +712,87 @@ def index():
       z-index: 10;
     }
 
-    /* Mobile-specific styles */
+    /* ✅ Mobile-specific styles - improved */
     @media (max-width: 768px) {
       .container {
         grid-template-columns: 1fr;
         gap: 1rem;
         padding: 0.75rem;
       }
-      
+
       .header-content {
         flex-direction: column;
         align-items: flex-start;
         gap: 0.5rem;
       }
-      
+
       .logo h1 {
         font-size: 1.3rem;
       }
-      
+
       .controls {
         width: 100%;
         justify-content: space-between;
       }
-      
+
       .btn {
         padding: 0.5rem 0.75rem;
         font-size: 0.8rem;
       }
-      
+
       .card-title {
         font-size: 1rem;
       }
-      
+
       .scan-info {
         grid-template-columns: 1fr;
       }
-      
+
       .image-grid {
         grid-template-columns: repeat(auto-fill, minmax(120px, 1fr));
         gap: 0.5rem;
       }
-      
+
       .verdict-container {
         flex-direction: column;
         align-items: flex-start;
       }
-      
+
       .pass-rate {
         width: 100%;
       }
-      
+
       .filters {
         grid-template-columns: 1fr;
       }
-      
+
       th, td {
         padding: 0.5rem;
         font-size: 0.75rem;
       }
-      
-      .info-value {
-        font-size: 0.85rem;
+
+      /* ✅ Critical: Make table scrollable on mobile */
+      .card-body > table {
+        display: block;
+        overflow-x: auto;
+        -webkit-overflow-scrolling: touch;
       }
-      
-      .details-panel {
-        font-size: 0.7rem;
-        max-height: 200px;
+
+      /* Add horizontal scrollbar for small screens */
+      ::-webkit-scrollbar {
+        height: 8px;
+      }
+      ::-webkit-scrollbar-track {
+        background: rgba(255,255,255,0.1);
+      }
+      ::-webkit-scrollbar-thumb {
+        background: rgba(120, 220, 255, 0.3);
+        border-radius: 4px;
+      }
+
+      /* Hide desktop app button on mobile */
+      .app-launch-btn {
+        display: none;
       }
     }
 
@@ -743,11 +801,11 @@ def index():
       .container {
         padding: 1rem;
       }
-      
+
       .filters {
         grid-template-columns: repeat(2, 1fr);
       }
-      
+
       .scan-info {
         grid-template-columns: 1fr;
       }
@@ -1024,10 +1082,11 @@ def index():
       try {
         const res = await api(`/api/scans?limit=${limit}`);
         const data = await res.json();
-        const filtered = applyFilters(data.items || []);
+        const items = Array.isArray(data.items) ? data.items : [];
+        const filtered = applyFilters(items);
         const tbody = $("tbody");
         tbody.innerHTML = "";
-        
+
         if (filtered.length === 0) {
           tbody.innerHTML = `
             <tr>
@@ -1047,33 +1106,33 @@ def index():
             loadScans();
           };
         } else {
-          filtered.forEach(row => {
+          filtered.forEach((row, i) => {
             const tr = document.createElement("tr");
-            tr.onclick = () => selectScan(row.ts || row["ts"]);
-            const verdict = row.verdict || row["verdict"] || "";
-            
-            // Safe value extraction helper
-            const safeNum = (val, def = "-") => {
-              if (val === null || val === undefined || val === "") return def;
-              const n = Number(val);
-              return isNaN(n) ? def : n.toFixed(2);
+            tr.onclick = () => selectScan(row.ts || row["ts"] || `scan-${i}`);
+
+            // ✅ Safe field extraction — prevents "undefined" → blank cells
+            const get = (key, fallback = "-") => {
+              return (row[key] !== undefined && row[key] !== null) 
+                ? String(row[key]) 
+                : (row[key.toLowerCase()] !== undefined && row[key.toLowerCase()] !== null)
+                  ? String(row[key.toLowerCase()]) 
+                  : fallback;
             };
 
-            // Extract all fields safely
-            const ts = row.ts || row["ts"] || "-";
-            const vehicle = row.vehicle_id || row["vehicle_id"] || "-";
-            const tire = row.tire_position || row["tire_position"] || "-";
-            const operator = row.operator || row["operator"] || "-";
-            const score = safeNum(row.score || row["score"]);
-            const brightness = safeNum(row.brightness || row["brightness"]);
-            const sharpness = safeNum(row.sharpness || row["sharpness"]);
-            const edgeDensity = safeNum(row.edge_density || row["edge_density"]);
-            const continuity = safeNum(row.continuity || row["continuity"]);
-            const notes = row.notes || row["notes"] || "-";
+            const ts = get("ts", "-");
+            const verdict = get("verdict", "—");
+            const score = get("score", "-");
+            const tire = get("tire_position", "-");
+            const vehicle = get("vehicle_id", "-");
+            const operator = get("operator", "-");
+            const brightness = get("brightness", "-");
+            const sharpness = get("sharpness", "-");
+            const edgeDensity = get("edge_density", "-");
+            const continuity = get("continuity", "-");
 
             tr.innerHTML = `
               <td>${ts}</td>
-              <td><span class="verdict-badge ${verdictClass(verdict)}">${verdict || "—"}</span></td>
+              <td><span class="verdict-badge ${verdictClass(verdict)}">${verdict}</span></td>
               <td>${score}</td>
               <td>${tire}</td>
               <td>${vehicle}</td>
@@ -1087,10 +1146,10 @@ def index():
           });
         }
 
-        const scores = filtered.map(r => r.score ?? r["score"] ?? 0);
+        const scores = filtered.map(r => parseFloat(r.score) || 0);
         drawHistogram(scores);
 
-        const passCount = filtered.filter(r => (r.verdict || r["verdict"] || "").toUpperCase().startsWith("PASS")).length;
+        const passCount = filtered.filter(r => (r.verdict || "").toUpperCase().startsWith("PASS")).length;
         const rate = filtered.length ? Math.round((passCount / filtered.length) * 100) : 0;
         $("passRate").textContent = `${rate}%`;
         $("passCount").textContent = `${passCount}/${filtered.length}`;

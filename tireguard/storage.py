@@ -157,7 +157,9 @@ def list_results(cfg, limit=30, vehicle_id=None, tire_position=None, verdict=Non
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
     cur.execute(f"""
-        SELECT ts, verdict, score, image_path, vehicle_id, tire_position
+        SELECT 
+            ts, verdict, score, vehicle_id, tire_position, operator,
+            brightness, sharpness, edge_density, continuity
         FROM results
         {where_sql}
         ORDER BY id DESC
@@ -170,9 +172,13 @@ def list_results(cfg, limit=30, vehicle_id=None, tire_position=None, verdict=Non
             "ts": r[0],
             "verdict": r[1],
             "score": r[2],
-            "image_path": r[3],
-            "vehicle_id": r[4],
-            "tire_position": r[5],
+            "vehicle_id": r[3],
+            "tire_position": r[4],
+            "operator": r[5],
+            "brightness": r[6],
+            "sharpness": r[7],
+            "edge_density": r[8],
+            "continuity": r[9],
         }
         for r in rows
     ]
