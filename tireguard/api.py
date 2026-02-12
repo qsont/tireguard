@@ -1272,8 +1272,16 @@ def index():
 
 
 def main():
+    import argparse
     import uvicorn
-    uvicorn.run("tireguard.api:app", host="127.0.0.1", port=8000, reload=True)
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--reload", action="store_true")
+    args = parser.parse_args()
+
+    uvicorn.run("tireguard.api:app", host=args.host, port=args.port, reload=args.reload)
 
 
 if __name__ == "__main__":
