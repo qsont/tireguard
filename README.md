@@ -52,12 +52,12 @@ tireguard/
 
 | Component | Specification | Purpose |
 |-----------|---------------|---------|
-| **Raspberry Pi** | Pi 4B (4GB+) or Pi 5 | Main processing unit |
-| **Camera** | Raspberry Pi HQ Camera (12.3MP) + 6mm lens | High-resolution tread capture |
-| **Display** | 7" Raspberry Pi Touch Display | Primary user interface |
-| **Lighting** | 60+ LED ring (5000K) + diffuser | Eliminates shadows in grooves *(critical)* |
+| **Raspberry Pi** | Pi 4B (4GB+)| Main processing unit |
+| **Camera** | Microscope like Camera with integrated Flash and capture buttons |
+| **Display** | 5" Touch Display | Primary user interface |
+<!-- | **Lighting** | 60+ LED ring (5000K) + diffuser | Eliminates shadows in grooves *(critical)* | -->
 | **Housing** | 3D-printed spacer enforcing 15cm distance | Fixes working distance for depth accuracy |
-| **Power** | 10,000mAh+ USB-C power bank | 4+ hours continuous operation |
+| **Power** | Battery Pack (two li-ion battery)| 4+ hours continuous operation (theoretical but not tested) |
 
 > 🔑 **Critical note**: Fixed 15cm working distance + ring lighting are **non-negotiable** for accuracy. Without these, monocular CV cannot achieve ≤0.5mm error vs. manual gauge.
 
@@ -165,13 +165,13 @@ for each_tire in 20_sample_tires:
     # - Processing time ≤ 5 seconds end-to-end
 ```
 
-**Required documentation for defense**:
+<!-- **Required documentation for defense (subject to change if possible and )**:
 - Completed Table 3.2 with 20+ tire measurements
 - Photos showing fixed-distance spacer + ring lighting integration
 - Screenshot of numeric mm output (not binary classification)
 - Statistical analysis of % differences (mean, std dev)
 
----
+--- -->
 
 ## ⚠️ Critical Implementation Notes
 
@@ -196,7 +196,7 @@ for each_tire in 20_sample_tires:
 | Slow processing (>5 sec) | Unoptimized OpenCV | Enable NEON: `pip uninstall opencv-python && pip install opencv-python-headless` |
 
 ---
-
+<!-- 
 ## 📚 Thesis Compliance Checklist
 
 Before defense, verify **ALL** items below:
@@ -210,10 +210,10 @@ Before defense, verify **ALL** items below:
 - [ ] **No AI/ML claims** made (uses traditional OpenCV only per Scope p.9)
 - [ ] Web app documented as **supplementary data viewer** (not primary interface)
 
----
+--- -->
 
 ## 📜 License
 
 This project is developed for academic purposes under Bulacan State University thesis requirements. Hardware designs and software are for educational use only.
 
-> **Disclaimer**: TireGuard is a proof-of-concept prototype. Always verify critical tire safety decisions with certified manual gauges before vehicle operation.
+> **Disclaimer**: TireGuard is a proof-of-concept prototype. Always verify critical tire safety decisions with certified manual gauges before vehicle operation. And also this readme file is subject to change so bear in mind some stuff will change as the full release it expected
