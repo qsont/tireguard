@@ -1,0 +1,60 @@
+{
+  "ts": "20260217_205953",
+  "camera_index": 0,
+  "roi": {
+    "x": 272,
+    "y": 0,
+    "w": 288,
+    "h": 216
+  },
+  "quality": {
+    "ok": false,
+    "reasons": [
+      "Too blurry (sharpness=11.8)"
+    ],
+    "metrics": {
+      "brightness": 82.4610982510288,
+      "glare_ratio": 0.0,
+      "sharpness": 11.753420961900666
+    }
+  },
+  "measure": {
+    "edge_density": 0.017746913580246913,
+    "continuity": 184.0,
+    "score": 0.03769756478089811
+  },
+  "verdict": "REPLACE",
+  "session": {
+    "vehicle_id": "TEST 6",
+    "tire_position": "SPARE",
+    "operator": "Charlers",
+    "notes": "test 6 for scanning data"
+  },
+  "calibration": {
+    "px_per_mm": 23.40939982143925,
+    "mm_per_px": 0.04271788288583805,
+    "method": "two_point"
+  },
+  "config": {
+    "data_dir": "data",
+    "captures_dir": "data/captures",
+    "processed_dir": "data/processed",
+    "db_path": "data/results.db",
+    "roi_path": "data/roi.json",
+    "export_csv_path": "data/results_export.csv",
+    "calibration_path": "data/calibration.json",
+    "cam_index": null,
+    "width": 1280,
+    "height": 720,
+    "fps": 30,
+    "min_brightness": 40.0,
+    "max_brightness": 220.0,
+    "max_glare_ratio": 0.06,
+    "min_sharpness": 80.0,
+    "clahe_clip": 2.0,
+    "clahe_grid": [
+      8,
+      8
+    ]
+  }
+}

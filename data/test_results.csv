@@ -1,0 +1,2 @@
+ts,manual_depth_mm,device_depth_mm,abs_error_mm,percent_diff,score,verdict,quality_ok,processing_time_s
+20260207_152411,2.3,5.838,3.538,153.838,0.026953,REPLACE,False,0.0811

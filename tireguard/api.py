@@ -2,12 +2,15 @@
 from __future__ import annotations
 
 import mimetypes
+import argparse
+import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Form
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+import uvicorn
 
 # Reuse your existing modules
 try:
@@ -16,7 +19,10 @@ except Exception:
     load_config = None  # type: ignore
 
 from .config import AppConfig
-from .storage import list_results, get_result_by_ts, export_csv, find_processed_images
+from .storage import (
+    list_results, get_result_by_ts, export_csv, find_processed_images,
+    list_validation_results, export_validation_summary
+)
 
 
 def _cfg():
@@ -32,12 +38,14 @@ def _cfg():
 
 
 def _safe_path(p: Any) -> Any:
+    """Convert Path objects to strings for JSON serialization."""
     if isinstance(p, Path):
         return str(p)
     return p
 
 
 def _jsonify(obj: Any) -> Any:
+    """Recursively convert objects to JSON-safe format."""
     if isinstance(obj, dict):
         return {k: _jsonify(_safe_path(v)) for k, v in obj.items()}
     if isinstance(obj, list):
@@ -49,20 +57,24 @@ app = FastAPI(title="TireGuard API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://127.0.0.1:8000", "http://localhost:8000"],
+    allow_origins=["http://127.0.0.1:8000", "http://localhost:8000", "http://0.0.0.0:8000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 
+# ---------- Health & Status ----------
 @app.get("/api/health")
 def health():
+    """Health check endpoint."""
     return {"ok": True, "service": "tireguard-api"}
 
 
+# ---------- Recent Scans ----------
 @app.get("/api/scans")
 def scans(limit: int = Query(50, ge=1, le=500)):
+    """List recent scan results with filtering support."""
     cfg = _cfg()
     rows = list_results(cfg, limit=limit)
     return _jsonify({"items": rows, "limit": limit})
@@ -70,6 +82,7 @@ def scans(limit: int = Query(50, ge=1, le=500)):
 
 @app.get("/api/scans/{ts}")
 def scan_detail(ts: str):
+    """Get detailed information for a specific scan by timestamp."""
     cfg = _cfg()
     row = get_result_by_ts(cfg, ts)
     if not row:
@@ -79,6 +92,7 @@ def scan_detail(ts: str):
 
 @app.get("/api/scans/{ts}/images")
 def scan_images(ts: str):
+    """Get list of processed images for a scan."""
     cfg = _cfg()
     paths = find_processed_images(cfg, ts)
     if not paths:
@@ -88,6 +102,7 @@ def scan_images(ts: str):
 
 @app.get("/api/images/{ts}/{kind}")
 def image(ts: str, kind: str):
+    """Serve a specific processed image (gray, edges, etc.)."""
     cfg = _cfg()
     paths = find_processed_images(cfg, ts)
     if not paths or kind not in paths:
@@ -101,8 +116,10 @@ def image(ts: str, kind: str):
     return FileResponse(str(p), media_type=mime or "image/png")
 
 
+# ---------- CSV Export ----------
 @app.get("/api/export/csv")
 def export_csv_route():
+    """Export all scan results to CSV."""
     cfg = _cfg()
     p = export_csv(cfg)
     p = Path(p)
@@ -111,8 +128,88 @@ def export_csv_route():
     return FileResponse(str(p), media_type="text/csv", filename=p.name)
 
 
+# ---------- Device Validation ----------
+@app.get("/api/validation")
+def validation(
+    limit: int = Query(50, ge=1, le=500),
+    tire_id: str | None = None,
+    verdict: str | None = None
+):
+    """List device validation results (Table 3.2 methodology)."""
+    cfg = _cfg()
+    rows = list_validation_results(cfg, limit=limit, tire_id=tire_id, verdict=verdict)
+    return _jsonify({"items": rows, "limit": limit})
+
+
+@app.get("/api/export/validation")
+def export_validation_route():
+    """Export validation summary (Table 3.2) to CSV."""
+    cfg = _cfg()
+    p = export_validation_summary(cfg)
+    p = Path(p)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="Validation CSV not found")
+    return FileResponse(str(p), media_type="text/csv", filename=p.name)
+
+
+# ---------- Web Dashboard ----------
+@app.post("/api/validation/submit")
+def submit_validation(
+    tire_id: str = Form(...),
+    manual_depth: float = Form(...),
+    scan_ts: str = Form(...)
+):
+    """Submit a manual validation entry linked to an existing scan."""
+    cfg = _cfg()
+
+    # ✅ Fix: always return JSON, never let FastAPI return HTML error pages
+    row = get_result_by_ts(cfg, scan_ts)
+    if not row:
+        return JSONResponse(
+            status_code=404,
+            content={"detail": f"Scan '{scan_ts}' not found. Make sure you captured a scan first before submitting validation."}
+        )
+
+    device_score = float(row.get("score") or 0.0)
+
+    # Compute device depth from linear model (slope=-6, intercept=6 default)
+    device_depth = max(0.0, -6.0 * device_score + 6.0)
+
+    abs_error = abs(device_depth - manual_depth)
+    percent_diff = (abs_error / manual_depth * 100.0) if manual_depth > 0 else 0.0
+
+    pass_pct = percent_diff <= 5.0
+    pass_err = abs_error    <= 0.5
+    verdict  = "PASS" if (pass_pct and pass_err) else "FAIL"
+
+    from .storage import insert_validation_result
+    insert_validation_result(cfg, {
+        "ts": time.strftime("%Y%m%d_%H%M%S"),
+        "tire_id": tire_id,
+        "manual_depth": manual_depth,
+        "device_score": device_score,
+        "device_depth": device_depth,
+        "percent_diff": percent_diff,
+        "abs_error_mm": abs_error,
+        "processing_time": 0.0,
+        "verdict": verdict,
+        "notes": f"Submitted via web dashboard | scan_ts={scan_ts}",
+    })
+
+    return JSONResponse(content=_jsonify({
+        "ok": True,
+        "tire_id": tire_id,
+        "manual_depth": manual_depth,
+        "device_depth": device_depth,
+        "percent_diff": percent_diff,
+        "abs_error_mm": abs_error,
+        "verdict": verdict,
+    }))
+
+
 @app.get("/")
 def index():
+    """Serve the main TireGuard web dashboard."""
     html = """
 <!DOCTYPE html>
 <html lang="en">
@@ -142,26 +239,25 @@ def index():
       --card-bg: #ffffff;
       --card-border: #e0e0e0;
       --shadow: 0 4px 6px rgba(0, 0, 0, 0.05);
-      --transition: all 0.2s ease;
+      --transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+      --shadow: 0 4px 6px rgba(0, 0, 0, 0.07), 0 1px 3px rgba(0, 0, 0, 0.06);
     }
 
     * {
       margin: 0;
       padding: 0;
       box-sizing: border-box;
-      font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
     }
 
     body {
-      background-color: #f5f7fb;
-      color: var(--gray-800);
-      line-height: 1.6;
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
       min-height: 100vh;
+      padding-bottom: 2rem;
     }
 
-    /* Header Styles */
     header {
-      background: linear-gradient(135deg, var(--primary), #0a58ca);
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
       color: white;
       padding: 1.25rem 1rem;
       display: flex;
@@ -201,8 +297,8 @@ def index():
 
     .logo h1 {
       font-weight: 700;
-      font-size: 1.5rem;
-      letter-spacing: -0.025em;
+      padding: 0.5rem 0;
+      margin: 0;
     }
 
     .logo p {
@@ -240,40 +336,25 @@ def index():
     .btn-primary:hover {
       background-color: var(--gray-100);
       transform: translateY(-2px);
-      box-shadow: 0 6px 12px rgba(0, 0, 0, 0.08);
+      box-shadow: 0 6px 12px rgba(0, 0, 0, 0.15);
     }
 
     .btn-outline {
-      background: transparent;
-      border: 2px solid white;
+      background-color: transparent;
       color: white;
+      border: 1px solid rgba(255, 255, 255, 0.3);
     }
 
     .btn-outline:hover {
-      background: white;
-      color: var(--primary);
-    }
-
-    .toggle-switch {
-      display: flex;
-      align-items: center;
-      gap: 0.5rem;
-      font-size: 0.8rem;
-      color: white;
-    }
-
-    .toggle-switch input {
-      position: absolute;
-      opacity: 0;
-      width: 0;
-      height: 0;
+      background-color: rgba(255, 255, 255, 0.1);
+      border-color: rgba(255, 255, 255, 0.5);
     }
 
     .toggle {
-      position: relative;
       display: inline-block;
-      width: 40px;
-      height: 22px;
+      position: relative;
+      width: 50px;
+      height: 24px;
     }
 
     .toggle input {
@@ -324,7 +405,6 @@ def index():
       background: rgba(255, 255, 255, 0.15);
     }
 
-    /* Desktop App Button - top right */
     .app-launch-btn {
       position: absolute;
       top: 1.25rem;
@@ -341,10 +421,12 @@ def index():
       gap: 0.5rem;
       transition: var(--transition);
     }
+
     .app-launch-btn:hover {
       background: rgba(255, 255, 255, 0.25);
       transform: translateY(-1px);
     }
+
     .app-launch-btn i {
       font-size: 1rem;
     }
@@ -461,7 +543,6 @@ def index():
       cursor: pointer;
     }
 
-    /* ✅ Fix: Add vertical scroll to Recent Scans card */
     .card-body > table {
       max-height: 400px;
       overflow-y: auto;
@@ -469,7 +550,6 @@ def index():
       border-bottom: 1px solid var(--gray-200);
     }
 
-    /* For mobile: make table scroll horizontally */
     @media (max-width: 768px) {
       .card-body > table {
         max-height: 300px;
@@ -502,6 +582,18 @@ def index():
       background-color: rgba(220, 53, 69, 0.1);
       color: var(--danger);
       border: 1px solid rgba(220, 53, 69, 0.2);
+    }
+
+    .verdict-good {
+      background-color: rgba(34, 197, 94, 0.1);
+      color: #22c55e;
+      border: 1px solid rgba(34, 197, 94, 0.2);
+    }
+
+    .verdict-replace {
+      background-color: rgba(239, 68, 68, 0.1);
+      color: #ef4444;
+      border: 1px solid rgba(239, 68, 68, 0.2);
     }
 
     /* Scan Details */
@@ -545,24 +637,6 @@ def index():
       padding: 0.5rem 1rem;
       border-radius: 12px;
       display: inline-block;
-    }
-
-    .verdict-pass .scan-verdict {
-      background-color: rgba(25, 135, 84, 0.1);
-      color: var(--success);
-      border: 1px solid rgba(25, 135, 84, 0.2);
-    }
-
-    .verdict-warning .scan-verdict {
-      background-color: rgba(255, 193, 7, 0.1);
-      color: var(--warning);
-      border: 1px solid rgba(255, 193, 7, 0.2);
-    }
-
-    .verdict-fail .scan-verdict {
-      background-color: rgba(220, 53, 69, 0.1);
-      color: var(--danger);
-      border: 1px solid rgba(220, 53, 69, 0.2);
     }
 
     .pass-rate {
@@ -638,7 +712,6 @@ def index():
       margin: 1rem 0;
       background: white;
       border-radius: 12px;
-      overflow: hidden;
       border: 1px solid var(--gray-200);
     }
 
@@ -704,15 +777,16 @@ def index():
       border-radius: 50%;
       background: rgba(0, 0, 0, 0.2);
       color: white;
+      border: none;
+      font-size: 1.5rem;
+      cursor: pointer;
       display: flex;
       align-items: center;
       justify-content: center;
-      font-size: 1.1rem;
-      cursor: pointer;
       z-index: 10;
     }
 
-    /* ✅ Mobile-specific styles - improved */
+    /* Mobile styles */
     @media (max-width: 768px) {
       .container {
         grid-template-columns: 1fr;
@@ -771,14 +845,12 @@ def index():
         font-size: 0.75rem;
       }
 
-      /* ✅ Critical: Make table scrollable on mobile */
       .card-body > table {
         display: block;
         overflow-x: auto;
         -webkit-overflow-scrolling: touch;
       }
 
-      /* Add horizontal scrollbar for small screens */
       ::-webkit-scrollbar {
         height: 8px;
       }
@@ -790,7 +862,6 @@ def index():
         border-radius: 4px;
       }
 
-      /* Hide desktop app button on mobile */
       .app-launch-btn {
         display: none;
       }
@@ -834,25 +905,28 @@ def index():
           <p>Real-time tire health monitoring system</p>
         </div>
       </div>
-      <div class="controls">
-        <button id="btnRefresh" class="btn btn-primary">
-          <i class="fas fa-sync-alt"></i> Refresh Data
-        </button>
-        <button id="btnExport" class="btn btn-outline">
-          <i class="fas fa-file-csv"></i> Export CSV
-        </button>
-        <div class="toggle-switch">
-          <span>Auto-refresh</span>
-          <label class="toggle">
-            <input type="checkbox" id="autoRefresh" checked>
-            <span class="slider"></span>
-          </label>
-        </div>
-        <div class="status-indicator">
-          <i class="fas fa-circle status-dot" style="color: #198754;"></i>
-          <span id="status">Ready</span>
-        </div>
+    </div>
+    <div class="controls">
+      <button id="btnRefresh" class="btn btn-primary">
+        <i class="fas fa-sync-alt"></i> Refresh Data
+      </button>
+      <button id="btnExport" class="btn btn-outline">
+        <i class="fas fa-file-csv"></i> Export CSV
+      </button>
+      <div class="toggle-switch">
+        <span>Auto-refresh</span>
+        <label class="toggle">
+          <input type="checkbox" id="autoRefresh" checked>
+          <span class="slider"></span>
+        </label>
       </div>
+      <div class="status-indicator">
+        <i class="fas fa-circle status-dot" style="color: #198754;"></i>
+        <span id="status">Ready</span>
+      </div>
+    </div>
+    <div class="app-launch-btn">
+      <i class="fas fa-desktop"></i> Desktop App Available
     </div>
   </header>
 
@@ -891,7 +965,7 @@ def index():
             <label for="fVerdict">Verdict</label>
             <select id="fVerdict" class="filter-control">
               <option value="">All verdicts</option>
-              <option>PASS</option>
+              <option>GOOD</option>
               <option>WARNING</option>
               <option>REPLACE</option>
             </select>
@@ -1000,6 +1074,111 @@ def index():
         </div>
       </div>
     </div>
+
+    <!-- ✅ Device Validation Card -->
+    <div class="card" style="grid-column: 1 / -1;">
+      <div class="card-header">
+        <h2 class="card-title"><i class="fas fa-balance-scale"></i> Device Validation (Table 3.2)</h2>
+        <div class="controls">
+          <button class="btn btn-outline" id="btnExportValidation">
+            <i class="fas fa-file-csv"></i> Export Table 3.2
+          </button>
+          <button class="btn btn-outline" id="btnRefreshVal">
+            <i class="fas fa-sync-alt"></i> Refresh
+          </button>
+        </div>
+      </div>
+      <div class="card-body">
+
+        <!-- ✅ Submit Validation Form -->
+        <div id="valForm" style="background:#f0f4ff; border:1px solid #c7d7ff; border-radius:12px; padding:1.25rem; margin-bottom:1.25rem;">
+          <h3 style="font-size:1rem; font-weight:700; color:#1d4ed8; margin-bottom:1rem;">
+            <i class="fas fa-plus-circle"></i> Submit New Validation Entry
+          </h3>
+          <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:1rem; align-items:end;">
+            <div class="filter-group">
+              <label>Scan Timestamp</label>
+              <input type="text" id="valScanTs" placeholder="e.g. 20260207_152411" class="filter-control" style="background:white;">
+            </div>
+            <div class="filter-group">
+              <label>Tire ID</label>
+              <input type="text" id="valTireIdInput" placeholder="e.g. TEST-01" class="filter-control" style="background:white;">
+            </div>
+            <div class="filter-group">
+              <label>Manual Depth (mm)</label>
+              <input type="number" id="valManualDepth" placeholder="e.g. 3.5" step="0.1" min="0" max="15" class="filter-control" style="background:white;">
+            </div>
+            <div>
+              <button id="btnSubmitVal" class="btn" style="background:#1d4ed8; color:white; width:100%; justify-content:center; padding:0.7rem 1rem;">
+                <i class="fas fa-check-circle"></i> Submit Validation
+              </button>
+            </div>
+          </div>
+          <div id="valFormResult" style="margin-top:0.75rem; display:none; padding:0.75rem; border-radius:8px; font-weight:600; font-size:0.9rem;"></div>
+          <p style="margin-top:0.75rem; font-size:0.78rem; color:#6c757d;">
+            💡 Tip: Click a scan row above to auto-fill the Scan Timestamp field.
+          </p>
+        </div>
+
+        <!-- Filters -->
+        <div class="filters">
+          <div class="filter-group">
+            <label for="fValTire">Filter by Tire ID</label>
+            <input type="text" id="fValTire" placeholder="Filter by tire ID" class="filter-control">
+          </div>
+          <div class="filter-group">
+            <label for="fValVerdict">Filter by Verdict</label>
+            <select id="fValVerdict" class="filter-control">
+              <option value="">All</option>
+              <option value="PASS">PASS</option>
+              <option value="FAIL">FAIL</option>
+            </select>
+          </div>
+        </div>
+
+        <table id="valTable">
+          <thead>
+            <tr>
+              <th>Timestamp</th>
+              <th>Tire ID</th>
+              <th>Manual (mm)</th>
+              <th>Device (mm)</th>
+              <th>% Diff</th>
+              <th>Error (mm)</th>
+              <th>Time (s)</th>
+              <th>Verdict</th>
+              <th>Notes</th>
+            </tr>
+          </thead>
+          <tbody id="valTbody"></tbody>
+        </table>
+
+        <div id="valSummary" style="margin-top:1rem; padding:1rem; background:#f8f9fa; border-radius:12px; display:none;">
+          <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(160px,1fr)); gap:1rem; text-align:center;">
+            <div>
+              <div style="font-size:0.75rem; color:var(--gray-600); font-weight:600;">TRIALS</div>
+              <div id="valCount" style="font-size:1.4rem; font-weight:800; color:var(--gray-800);">0</div>
+            </div>
+            <div>
+              <div style="font-size:0.75rem; color:var(--gray-600); font-weight:600;">AVG % DIFF</div>
+              <div id="valAvgPct" style="font-size:1.4rem; font-weight:800; color:#1d4ed8;">—</div>
+            </div>
+            <div>
+              <div style="font-size:0.75rem; color:var(--gray-600); font-weight:600;">MAX ERROR (mm)</div>
+              <div id="valMaxErr" style="font-size:1.4rem; font-weight:800; color:#dc2626;">—</div>
+            </div>
+            <div>
+              <div style="font-size:0.75rem; color:var(--gray-600); font-weight:600;">PASS RATE</div>
+              <div id="valPassRate" style="font-size:1.4rem; font-weight:800; color:#16a34a;">—</div>
+            </div>
+            <div>
+              <div style="font-size:0.75rem; color:var(--gray-600); font-weight:600;">OVERALL</div>
+              <div id="valOverall" style="font-size:1.4rem; font-weight:800;">—</div>
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
   </div>
 
   <div class="modal" id="imgModal">
@@ -1022,8 +1201,11 @@ def index():
 
     function verdictClass(v) {
       v = (v || "").toUpperCase();
-      if (v.startsWith("PASS") || v === "OK") return "verdict-pass";
-      if (v.includes("WARN")) return "verdict-warning";
+      if (v === "GOOD" || v === "OK") return "verdict-good";
+      if (v === "WARNING" || v.includes("WARN")) return "verdict-warning";
+      if (v === "REPLACE") return "verdict-replace";
+      if (v === "PASS") return "verdict-pass";
+      if (v === "FAIL") return "verdict-fail";
       return "verdict-fail";
     }
 
@@ -1110,7 +1292,6 @@ def index():
             const tr = document.createElement("tr");
             tr.onclick = () => selectScan(row.ts || row["ts"] || `scan-${i}`);
 
-            // ✅ Safe field extraction — prevents "undefined" → blank cells
             const get = (key, fallback = "-") => {
               return (row[key] !== undefined && row[key] !== null) 
                 ? String(row[key]) 
@@ -1149,7 +1330,7 @@ def index():
         const scores = filtered.map(r => parseFloat(r.score) || 0);
         drawHistogram(scores);
 
-        const passCount = filtered.filter(r => (r.verdict || "").toUpperCase().startsWith("PASS")).length;
+        const passCount = filtered.filter(r => (r.verdict || "").toUpperCase().startsWith("GOOD")).length;
         const rate = filtered.length ? Math.round((passCount / filtered.length) * 100) : 0;
         $("passRate").textContent = `${rate}%`;
         $("passCount").textContent = `${passCount}/${filtered.length}`;
@@ -1157,7 +1338,7 @@ def index():
         status(`Loaded ${filtered.length} scans`);
       } catch (error) {
         status(`Error: ${error.message}`);
-        console.error("API Error:", error);
+        console.error("Scan list error:", error);
       }
     }
 
@@ -1198,7 +1379,7 @@ def index():
           
           const prefer = ["gray", "edges_closed", "edges", "original"];
           const ordered = [...new Set([...prefer, ...keys])].filter(k => keys.includes(k));
-          
+
           ordered.slice(0, 4).forEach(kind => {
             const box = document.createElement("div");
             box.className = "image-card";
@@ -1233,6 +1414,81 @@ def index():
       }
     }
 
+    async function loadValidation() {
+      status("Loading validation data...");
+      const tireId = $("fValTire").value.trim() || undefined;
+      const verdict = $("fValVerdict").value.trim() || undefined;
+      
+      try {
+        const query = new URLSearchParams();
+        query.append("limit", 100);
+        if (tireId) query.append("tire_id", tireId);
+        if (verdict) query.append("verdict", verdict);
+        
+        const res = await api(`/api/validation?${query}`);
+        const data = await res.json();
+        const items = Array.isArray(data.items) ? data.items : [];
+        const tbody = $("valTbody");
+        tbody.innerHTML = "";
+
+        if (items.length === 0) {
+          tbody.innerHTML = `
+            <tr>
+              <td colspan="8" style="text-align: center; padding: 2rem; color: #6c757d;">
+                No validation results found
+              </td>
+            </tr>
+          `;
+          $("valSummary").style.display = "none";
+        } else {
+          items.forEach((row) => {
+            const tr = document.createElement("tr");
+            const ts         = row.ts || row.created_at || "—";
+            const tireId     = row.tire_id || "—";
+            const manualDepth  = typeof row.manual_depth  === "number" ? row.manual_depth.toFixed(2)  : "—";
+            const deviceDepth  = typeof row.device_depth  === "number" ? row.device_depth.toFixed(2)  : "—";
+            const percentDiff  = typeof row.percent_diff  === "number" ? row.percent_diff.toFixed(2)  : "—";
+            const absErr       = typeof row.abs_error_mm  === "number" ? row.abs_error_mm.toFixed(3)  : "—";
+            const procTime     = typeof row.processing_time === "number" ? row.processing_time.toFixed(2) : "—";
+            const verd         = row.verdict || "—";
+            const notes        = row.notes || "—";
+
+            tr.innerHTML = `
+              <td>${ts}</td>
+              <td><strong>${tireId}</strong></td>
+              <td>${manualDepth}</td>
+              <td>${deviceDepth}</td>
+              <td>${percentDiff === "—" ? "—" : percentDiff + "%"}</td>
+              <td>${absErr}</td>
+              <td>${procTime}</td>
+              <td><span class="verdict-badge ${verdictClass(verd)}">${verd}</span></td>
+              <td style="font-size:0.75rem; color:#6c757d; max-width:180px; white-space:normal;">${notes}</td>
+            `;
+            tbody.appendChild(tr);
+          });
+
+          // Summary stats
+          const avgPct     = (items.reduce((s, r) => s + (r.percent_diff || 0), 0) / items.length).toFixed(2);
+          const maxErr     = Math.max(...items.map(r => r.abs_error_mm || 0)).toFixed(3);
+          const passCount  = items.filter(r => (r.verdict || "").toUpperCase() === "PASS").length;
+          const passRate   = Math.round((passCount / items.length) * 100);
+          const overall    = passCount === items.length ? "✅ ALL PASS" : `${passCount}/${items.length} PASS`;
+
+          $("valCount").textContent    = items.length;
+          $("valAvgPct").textContent   = `${avgPct}%`;
+          $("valMaxErr").textContent   = maxErr;
+          $("valPassRate").textContent = `${passRate}%`;
+          $("valOverall").textContent  = overall;
+          $("valSummary").style.display = "block";
+        }
+
+        status(`Validation: ${items.length} trials`);
+      } catch (error) {
+        status(`Validation error: ${error.message}`);
+        console.error("Validation load error:", error);
+      }
+    }
+
     let pollTimer = null;
     function startPolling() {
       if (pollTimer) clearInterval(pollTimer);
@@ -1243,10 +1499,110 @@ def index():
 
     $("btnRefresh").onclick = loadScans;
     $("btnExport").onclick = () => { window.location.href = "/api/export/csv"; };
+    $("btnExportValidation").onclick = () => { window.location.href = "/api/export/validation"; };
+    $("btnRefreshVal").onclick = loadValidation;
     $("autoRefresh").onchange = startPolling;
 
+    // ✅ Auto-fill scan timestamp when clicking a scan row
+    const origLoadScans = loadScans;
+    async function loadScansWithAutoFill() {
+      await origLoadScans();
+      // Attach click-to-fill on all scan rows
+      document.querySelectorAll("#tbody tr").forEach(tr => {
+        tr.addEventListener("click", () => {
+          const tsCell = tr.querySelector("td:first-child");
+          if (tsCell) {
+            $("valScanTs").value = tsCell.textContent.trim();
+            $("valScanTs").style.borderColor = "#1d4ed8";
+            $("valForm").scrollIntoView({ behavior: "smooth", block: "nearest" });
+          }
+        });
+      });
+    }
+
+    // ✅ Submit validation form
+    $("btnSubmitVal").onclick = async () => {
+      const scanTs     = $("valScanTs").value.trim();
+      const tireId     = $("valTireIdInput").value.trim();
+      const manualMm   = parseFloat($("valManualDepth").value);
+      const resultDiv  = $("valFormResult");
+
+      if (!scanTs || !tireId || isNaN(manualMm) || manualMm <= 0) {
+        resultDiv.style.display = "block";
+        resultDiv.style.background = "#fff3cd";
+        resultDiv.style.color = "#856404";
+        resultDiv.textContent = "⚠️ Please fill in all fields: Scan Timestamp, Tire ID, and Manual Depth.";
+        return;
+      }
+
+      $("btnSubmitVal").disabled = true;
+      $("btnSubmitVal").textContent = "Submitting...";
+
+      try {
+        const form = new FormData();
+        form.append("tire_id", tireId);
+        form.append("manual_depth", manualMm);
+        form.append("scan_ts", scanTs);
+
+        const res = await fetch("/api/validation/submit", { method: "POST", body: form });
+        
+        // ✅ Fix: check content-type before parsing JSON
+        const contentType = res.headers.get("content-type") || "";
+        let data;
+        if (contentType.includes("application/json")) {
+          data = await res.json();
+        } else {
+          const text = await res.text();
+          throw new Error(`Server error (${res.status}): ${text.substring(0, 200)}`);
+        }
+
+        if (!res.ok) throw new Error(data.detail || "Submission failed");
+
+        const isPass = data.verdict === "PASS";
+        resultDiv.style.display = "block";
+        resultDiv.style.background = isPass ? "#d1fae5" : "#fee2e2";
+        resultDiv.style.color = isPass ? "#065f46" : "#991b1b";
+        resultDiv.innerHTML = `
+          ${isPass ? "✅" : "❌"} <strong>${data.verdict}</strong> &nbsp;|&nbsp;
+          Tire: <strong>${data.tire_id}</strong> &nbsp;|&nbsp;
+          Manual: <strong>${data.manual_depth.toFixed(2)} mm</strong> &nbsp;|&nbsp;
+          Device: <strong>${data.device_depth.toFixed(2)} mm</strong> &nbsp;|&nbsp;
+          Error: <strong>${data.abs_error_mm.toFixed(3)} mm</strong> &nbsp;|&nbsp;
+          % Diff: <strong>${data.percent_diff.toFixed(2)}%</strong>
+        `;
+
+        $("valTireIdInput").value = "";
+        $("valManualDepth").value = "";
+        await loadValidation();
+
+      } catch (err) {
+        resultDiv.style.display = "block";
+        resultDiv.style.background = "#fee2e2";
+        resultDiv.style.color = "#991b1b";
+        resultDiv.textContent = `❌ Error: ${err.message}`;
+      } finally {
+        $("btnSubmitVal").disabled = false;
+        $("btnSubmitVal").innerHTML = '<i class="fas fa-check-circle"></i> Submit Validation';
+      }
+    };
+
+    // Also update valTbody to include notes column
     ["fVehicle", "fTire", "fVerdict", "limit"].forEach(id => {
-      $(id).addEventListener("input", loadScans);
+      const el = $(id);
+      if (el) el.addEventListener("change", loadScans);
+      if (el) el.addEventListener("input", () => {
+        clearTimeout(el._timeout);
+        el._timeout = setTimeout(loadScans, 300);
+      });
+    });
+
+    ["fValTire", "fValVerdict"].forEach(id => {
+      const el = $(id);
+      if (el) el.addEventListener("change", loadValidation);
+      if (el) el.addEventListener("input", () => {
+        clearTimeout(el._timeout);
+        el._timeout = setTimeout(loadValidation, 300);
+      });
     });
 
     $("imgModal").onclick = (e) => {
@@ -1254,27 +1610,23 @@ def index():
         $("imgModal").classList.remove("active");
       }
     };
-
     $("modalClose").onclick = () => {
       $("imgModal").classList.remove("active");
     };
 
-    // Initialize
     document.addEventListener('DOMContentLoaded', () => {
       loadScans();
+      loadValidation();
       startPolling();
     });
   </script>
 </body>
-</html>
-"""
-    return HTMLResponse(content=html)
+</html>"""
+    return HTMLResponse(html)
 
 
 def main():
-    import argparse
-    import uvicorn
-
+    """Run the FastAPI server with uvicorn."""
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="0.0.0.0")
     parser.add_argument("--port", type=int, default=8000)

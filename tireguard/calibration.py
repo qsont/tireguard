@@ -25,3 +25,46 @@ def compute_scale_from_two_points(p0, p1, known_mm: float):
     px_per_mm = dpx / known_mm
     mm_per_px = known_mm / dpx
     return px_per_mm, mm_per_px
+
+def score_to_depth_mm(
+    score: float,
+    calib: dict | None = None,
+    fallback_slope: float = -6.0,
+    fallback_intercept: float = 6.0,
+) -> float:
+    """
+    Convert TireGuard score -> depth(mm) using model stored in calibration.json.
+
+    Supported model formats in calib:
+      {
+        "score_model": {
+          "type": "linear",
+          "slope": -6.0,
+          "intercept": 6.0
+        }
+      }
+
+      {
+        "score_model": {
+          "type": "poly",
+          "coeffs": [a_n, ..., a_1, a_0]  # Horner evaluation
+        }
+      }
+    """
+    c = calib or {}
+    model = c.get("score_model") or {}
+    s = float(score)
+
+    mtype = str(model.get("type", "linear")).lower()
+
+    if mtype == "poly":
+        coeffs = model.get("coeffs") or []
+        if coeffs:
+            y = 0.0
+            for a in coeffs:
+                y = y * s + float(a)
+            return max(0.0, float(y))
+
+    slope = float(model.get("slope", fallback_slope))
+    intercept = float(model.get("intercept", fallback_intercept))
+    return max(0.0, slope * s + intercept)

@@ -4,8 +4,11 @@ import cv2
 import numpy as np
 import time
 from dataclasses import asdict
+from typing import Optional, Tuple, Dict, Any
+from pathlib import Path
+
 from PySide6.QtCore import Qt, QTimer, QPropertyAnimation, QEasingCurve, QRect, QSize, QEvent
-from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QAction, QFont
+from PySide6.QtGui import QImage, QPixmap, QPainter, QPen, QColor, QAction, QFont, QDoubleValidator
 from PySide6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QVBoxLayout, QHBoxLayout,
     QGroupBox, QLineEdit, QComboBox, QTextEdit, QListWidget, QSplitter,
@@ -15,27 +18,40 @@ try:
     from PySide6.QtWidgets import QScroller
 except Exception:
     QScroller = None
+
 from .config import APP_NAME, RES_PRESETS
 from .camera import open_camera
 from .preprocess import preprocess_bgr, crop_roi
 from .quality import run_quality_checks
 from .measure import groove_visibility_score, pass_fail_from_score
 from .auto_roi import suggest_roi
-from .calibration import load_calibration, save_calibration, compute_scale_from_two_points
+from .calibration import (
+    load_calibration, save_calibration, compute_scale_from_two_points, score_to_depth_mm
+)
 from .live_metrics import compute_live_metrics
 from .storage import (
     init_db, save_capture, save_processed, insert_result, export_csv,
-    list_results, get_result_by_ts, find_processed_images
+    list_results, get_result_by_ts, find_processed_images, insert_validation_result,
+    export_validation_summary
 )
 
-# ---------- Helpers ----------
+# ---------- Constants ----------
+VALIDATION_THRESHOLDS = {
+    "max_percent_diff": 5.0,      # ≤5% difference acceptable
+    "max_abs_error_mm": 0.5,      # ≤0.5mm error acceptable
+    "max_processing_time_s": 5.0, # ≤5s processing time acceptable
+}
+
+# ---------- Helper Functions ----------
 def bgr_to_qimage(bgr: np.ndarray) -> QImage:
+    """Convert OpenCV BGR image to QImage for display."""
     rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
     h, w, ch = rgb.shape
     bytes_per_line = ch * w
     return QImage(rgb.data, w, h, bytes_per_line, QImage.Format_RGB888).copy()
 
-def clamp_roi(roi, frame_shape):
+def clamp_roi(roi: Dict[str, float], frame_shape: Tuple) -> Dict[str, int]:
+    """Ensure ROI stays within frame boundaries."""
     fh, fw = frame_shape[:2]
     x = max(0, min(fw-1, int(roi["x"])))
     y = max(0, min(fh-1, int(roi["y"])))
@@ -43,8 +59,10 @@ def clamp_roi(roi, frame_shape):
     h = max(1, min(fh-y, int(roi["h"])))
     return {"x": x, "y": y, "w": w, "h": h}
 
-# ---------- Toast ----------
+# ---------- Toast Notification Widget ----------
 class Toast(QWidget):
+    """Non-blocking toast notification with animation."""
+    
     def __init__(self, parent):
         super().__init__(parent)
         self.setAttribute(Qt.WA_TransparentForMouseEvents, True)
@@ -66,29 +84,28 @@ class Toast(QWidget):
         self.anim = QPropertyAnimation(self, b"geometry")
         self.anim.setEasingCurve(QEasingCurve.OutCubic)
         self.hide()
-        # Install event filter on parent for resize handling
         if parent:
             parent.installEventFilter(self)
 
     def eventFilter(self, obj, event):
-        # Use QEvent.Resize constant instead of event.Resize
         if obj == self.parent() and event.type() == QEvent.Resize:
             self._update_position()
-        return False  # Always return False to allow event propagation
+        return False
 
     def _update_position(self):
+        """Position toast at top-center of parent."""
         parent = self.parentWidget()
         if not parent or not parent.isVisible():
             return
         w = min(420, max(220, self.width()))
         h = self.height()
         margin = 20
-        # Position at top center instead of bottom center
         x = (parent.width() - w) // 2
         y = margin
         self.setGeometry(x, y, w, h)
 
-    def show_toast(self, text, ms=1800):
+    def show_toast(self, text: str, ms: int = 1800):
+        """Display toast for specified duration."""
         self.label.setText(text)
         self.adjustSize()
         self._update_position()
@@ -103,46 +120,52 @@ class Toast(QWidget):
     def _hide(self):
         self.hide()
 
-# ---------- Status Chip ----------
+# ---------- Status Chip Widget ----------
 class StatusChip(QLabel):
-    def __init__(self, text="READY"):
+    """Status indicator with color-coded states."""
+    
+    STATE_STYLES = {
+        "ok": "background: rgba(34,197,94,0.15); border: 1px solid rgba(34,197,94,0.5); color: #22c55e;",        # GREEN
+        "warn": "background: rgba(251,146,60,0.15); border: 1px solid rgba(251,146,60,0.5); color: #fb923c;",    # ORANGE
+        "fail": "background: rgba(239,68,68,0.15); border: 1px solid rgba(239,68,68,0.5); color: #ef4444;",      # RED
+        "ready": "background: rgba(120,220,255,0.10); border: 1px solid rgba(120,220,255,0.35); color: #9bdcff;", # CYAN
+    }
+    
+    def __init__(self, text: str = "READY"):
         super().__init__(text)
         self.setAlignment(Qt.AlignCenter)
         self.setMinimumHeight(28)
         self.setStyleSheet("border-radius: 14px; padding: 4px 10px; font-weight: 800; letter-spacing: 0.5px;")
         self.set_state("ready")
 
-    def set_state(self, state: str, text: str | None = None):
-        # states: ok, warn, fail, ready
+    def set_state(self, state: str, text: Optional[str] = None):
+        """Update state and optionally change label text."""
         if text is not None:
             self.setText(text)
-        if state == "ok":
-            self.setStyleSheet(self.styleSheet() + "background: rgba(0,255,170,0.14); border: 1px solid rgba(0,255,170,0.45); color: #7fffd4;")
-        elif state == "warn":
-            self.setStyleSheet(self.styleSheet() + "background: rgba(255,210,70,0.14); border: 1px solid rgba(255,210,70,0.45); color: #ffe08a;")
-        elif state == "fail":
-            self.setStyleSheet(self.styleSheet() + "background: rgba(255,70,120,0.14); border: 1px solid rgba(255,70,120,0.45); color: #ff8ab3;")
-        else:
-            self.setStyleSheet(self.styleSheet() + "background: rgba(120,220,255,0.10); border: 1px solid rgba(120,220,255,0.35); color: #9bdcff;")
+        style = self.STATE_STYLES.get(state, self.STATE_STYLES["ready"])
+        self.setStyleSheet("border-radius: 14px; padding: 4px 10px; font-weight: 800; letter-spacing: 0.5px;" + style)
 
-# ---------- Video ----------
+# ---------- Video Display Widget ----------
 class VideoWidget(QLabel):
+    """Video preview with ROI/calibration overlay."""
+    
     def __init__(self):
         super().__init__()
         self.setMinimumSize(820, 600)
         self.setAlignment(Qt.AlignCenter)
         self.setStyleSheet("background:#0b0f14; border-radius:18px; border: 1px solid rgba(120,220,255,0.18);")
-        self.frame_bgr = None
-        self.roi = None
+        self.frame_bgr: Optional[np.ndarray] = None
+        self.roi: Optional[Dict] = None
         self.roi_mode = False
         self.dragging = False
-        self.drag_start = None
-        self.drag_end = None
+        self.drag_start: Optional[Tuple] = None
+        self.drag_end: Optional[Tuple] = None
         self.calib_mode = False
-        self.calib_points = []
+        self.calib_points: list = []
         self._resize_mode = False
 
-    def set_modes(self, roi_mode=False, calib_mode=False):
+    def set_modes(self, roi_mode: bool = False, calib_mode: bool = False):
+        """Set interaction mode (ROI editing or calibration)."""
         self.roi_mode = roi_mode
         self.calib_mode = calib_mode
         if not calib_mode:
@@ -153,7 +176,8 @@ class VideoWidget(QLabel):
             self._resize_mode = False
         self.update()
 
-    def set_frame(self, frame_bgr, roi=None):
+    def set_frame(self, frame_bgr: np.ndarray, roi: Optional[Dict] = None):
+        """Update displayed frame and optionally ROI."""
         self.frame_bgr = frame_bgr
         if roi is not None:
             self.roi = roi
@@ -196,7 +220,8 @@ class VideoWidget(QLabel):
             w.on_roi_drag_finished()
         self._resize_mode = False
 
-    def _widget_to_frame(self, x, y):
+    def _widget_to_frame(self, x: int, y: int) -> Tuple[int, int]:
+        """Convert widget coordinates to frame coordinates."""
         if self.frame_bgr is None:
             return 0, 0
         fh, fw = self.frame_bgr.shape[:2]
@@ -217,12 +242,17 @@ class VideoWidget(QLabel):
         super().paintEvent(e)
         if self.frame_bgr is None:
             return
+        
         qimg = bgr_to_qimage(self.frame_bgr)
-        pix = QPixmap.fromImage(qimg).scaled(self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        pix = QPixmap.fromImage(qimg).scaled(
+            self.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+        )
         self.setPixmap(pix)
+        
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing)
-        # map frame->widget overlay via aspect-fit math
+        
+        # Calculate overlay coordinates
         fh, fw = self.frame_bgr.shape[:2]
         ww = max(1, self.width())
         wh = max(1, self.height())
@@ -235,7 +265,7 @@ class VideoWidget(QLabel):
         def f2w(px, py):
             return ox + int(px * scale), oy + int(py * scale)
 
-        # saved ROI
+        # Draw saved ROI
         if self.roi:
             x, y, w, h = self.roi["x"], self.roi["y"], self.roi["w"], self.roi["h"]
             x0, y0 = f2w(x, y)
@@ -244,7 +274,7 @@ class VideoWidget(QLabel):
             painter.setPen(pen)
             painter.drawRoundedRect(x0, y0, x1-x0, y1-y0, 14, 14)
 
-        # drag ROI preview
+        # Draw ROI drag preview
         if self.roi_mode and self.drag_start and self.drag_end:
             x0, y0 = self.drag_start
             x1, y1 = self.drag_end
@@ -252,7 +282,7 @@ class VideoWidget(QLabel):
             painter.setPen(pen)
             painter.drawRect(int(min(x0, x1)), int(min(y0, y1)), int(abs(x1-x0)), int(abs(y1-y0)))
 
-        # calib overlay
+        # Draw calibration points
         if self.calib_mode and self.calib_points:
             pen = QPen(QColor("#7bdcff"), 3)
             painter.setPen(pen)
@@ -261,40 +291,51 @@ class VideoWidget(QLabel):
             if len(self.calib_points) == 2:
                 p0, p1 = self.calib_points
                 painter.drawLine(int(p0[0]), int(p0[1]), int(p1[0]), int(p1[1]))
+        
         painter.end()
 
-# ---------- Main (Wizard) ----------
+# ---------- Main Application Window ----------
 class MainWindow(QMainWindow):
+    """TireGuard main UI with 4-step wizard workflow."""
+    
     def __init__(self, cfg):
         super().__init__()
         self.cfg = cfg
         init_db(cfg)
         self.setWindowTitle(APP_NAME)
         self.resize(1360, 800)
-        self._apply_theme()
+        
+        # Core state
         self.cap = None
         self.cam_index = None
-        self.roi = None
+        self.roi: Optional[Dict] = None
         self.calib = load_calibration(cfg.calibration_path)
-        # Live ROI metrics state
+        
+        # Live metrics state
         self.prev_roi_gray = None
         self.live_last = None
         self.auto_trigger_enabled = False
         self.stable_ok_frames = 0
         self._metrics_last_t = 0.0
-        # Auto-trigger safety
+        
+        # Capture safety
         self._auto_last_capture_t = 0.0
         self._auto_cooldown_s = 2.0
         self._capture_busy = False
+        
         self.toast = Toast(self)
+        self._apply_theme()
         self._build_ui()
         self._open_camera()
         self._refresh_history()
+        
+        # Start main loop
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(15)
 
     def _apply_theme(self):
+        """Apply dark theme with cyan accents."""
         self.setStyleSheet("""
             QMainWindow {
                 background: #070a10;
@@ -374,15 +415,12 @@ class MainWindow(QMainWindow):
             QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {
                 background: transparent;
             }
-
             QWidget#sessionContainer {
                 background: rgba(12, 18, 28, 0.95);
             }
             QScrollArea > QWidget {
                 background: rgba(12, 18, 28, 0.95);
             }
-
-            /* ✅ Critical: Fix combo box popup & editor background */
             QComboBox QAbstractItemView {
                 background: rgba(12, 18, 28, 0.95);
                 border: 1px solid rgba(120, 220, 255, 0.18);
@@ -415,17 +453,17 @@ class MainWindow(QMainWindow):
             }
         """)
 
-    # ---------- UI ----------
+    # ---------- UI Building ----------
     def _build_ui(self):
+        """Construct main UI layout."""
         central = QWidget()
         self.setCentralWidget(central)
         
-        # Create a main layout with proper spacing
         main_layout = QVBoxLayout(central)
         main_layout.setContentsMargins(10, 10, 10, 10)
         main_layout.setSpacing(10)
         
-        # Top bar: title + chip
+        # Top bar
         top = QHBoxLayout()
         title = QLabel("TireGuard")
         title.setFont(QFont("Arial", 18, QFont.Bold))
@@ -440,18 +478,14 @@ class MainWindow(QMainWindow):
         top.addStretch(1)
         top.addWidget(self.chip)
         
-        # Main: split video + wizard panel
+        # Main content: split video + wizard
         self.video = VideoWidget()
         self.video.setParent(self)
         self.steps = QStackedWidget()
         
-        # Step 1: Camera
         self.steps.addWidget(self._step_camera())
-        # Step 2: ROI
         self.steps.addWidget(self._step_roi())
-        # Step 3: Calibrate
         self.steps.addWidget(self._step_calibrate())
-        # Step 4: Scan
         self.steps.addWidget(self._step_scan())
         
         self.btn_back = QPushButton("← Back")
@@ -463,7 +497,6 @@ class MainWindow(QMainWindow):
         nav.addWidget(self.btn_back)
         nav.addWidget(self.btn_next)
         
-        # Right panel without scroll area (fixed width constraints)
         right_content = QWidget()
         right_layout = QVBoxLayout(right_content)
         right_layout.setContentsMargins(0, 0, 0, 0)
@@ -471,49 +504,41 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.steps)
         right_layout.addLayout(nav)
         
-        # Make right panel expandable but with proper constraints
         right_content.setMinimumWidth(420)
         right_content.setMaximumWidth(600)
         
-        # Create a flexible splitter that maintains aspect ratio
         splitter = QSplitter(Qt.Horizontal)
         splitter.addWidget(self.video)
         splitter.addWidget(right_content)
-        
-        # Configure the splitter for better resizing behavior
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(8)
         splitter.setSizes([800, 400])
+        splitter.setStretchFactor(0, 3)
+        splitter.setStretchFactor(1, 1)
         
-        # Set stretch factors for responsive behavior
-        splitter.setStretchFactor(0, 3)   # video takes more space
-        splitter.setStretchFactor(1, 1)   # right panel takes less space
-        
-        # Make sure video maintains aspect ratio
         self.video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right_content.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         
-        # Add all elements to main layout
         main_layout.addLayout(top)
         main_layout.addWidget(splitter)
         
-        # Advanced dock
         self._build_advanced_dock()
         
-        # menu
         act_adv = QAction("Toggle Advanced", self)
         act_adv.triggered.connect(self.toggle_advanced)
         self.menuBar().addAction(act_adv)
         self._update_nav_buttons()
 
     def _card(self, title_text: str, body_widget: QWidget) -> QWidget:
+        """Create a styled card widget."""
         box = QGroupBox(title_text)
         v = QVBoxLayout()
         v.addWidget(body_widget)
         box.setLayout(v)
         return box
 
-    def _step_camera(self):
+    def _step_camera(self) -> QWidget:
+        """Step 1: Camera selection."""
         w = QWidget()
         v = QVBoxLayout()
         hint = QLabel("Step 1: Choose camera & resolution")
@@ -540,7 +565,8 @@ class MainWindow(QMainWindow):
         w.setLayout(v)
         return w
 
-    def _step_roi(self):
+    def _step_roi(self) -> QWidget:
+        """Step 2: ROI (Region of Interest) selection."""
         w = QWidget()
         v = QVBoxLayout()
         hint = QLabel("Step 2: Set ROI (tread area)")
@@ -571,7 +597,8 @@ class MainWindow(QMainWindow):
         w.setLayout(v)
         return w
 
-    def _step_calibrate(self):
+    def _step_calibrate(self) -> QWidget:
+        """Step 3: Optional scale calibration."""
         w = QWidget()
         v = QVBoxLayout()
         hint = QLabel("Step 3: (Optional) Calibration")
@@ -598,16 +625,16 @@ class MainWindow(QMainWindow):
         w.setLayout(v)
         return w
 
-    def _step_scan(self):
+    def _step_scan(self) -> QWidget:
+        """Step 4: Capture and analysis."""
         w = QWidget()
         v = QVBoxLayout()
         hint = QLabel("Step 4: Scan & Save")
         hint.setStyleSheet("color: rgba(232,247,255,0.78); font-weight:700;")
         v.addWidget(hint)
         
-        # session fields - wrap in scroll area
         sess = QWidget()
-        sess.setObjectName("sessionContainer")  # 👈 Add this line
+        sess.setObjectName("sessionContainer")
         f = QFormLayout()
         self.in_vehicle = QLineEdit()
         self.in_operator = QLineEdit()
@@ -620,7 +647,6 @@ class MainWindow(QMainWindow):
         f.addRow("Notes", self.in_notes)
         sess.setLayout(f)
         
-        # Create a scroll area for session section
         sess_scroll = QScrollArea()
         sess_scroll.setWidgetResizable(True)
         sess_scroll.setFrameShape(QFrame.NoFrame)
@@ -629,14 +655,12 @@ class MainWindow(QMainWindow):
         
         v.addWidget(self._card("Session", sess_scroll))
         
-        # Aim Assist (live metrics) - wrap in scroll area
         self.aim_text = QLabel("Aim Assist: set ROI to see live metrics")
         self.aim_text.setStyleSheet("color: rgba(232,247,255,0.75); font-weight:700;")
         self.aim_box = QTextEdit()
         self.aim_box.setReadOnly(True)
         self.aim_box.setMinimumHeight(120)
         
-        # Create a scroll area for aim assist section
         aim_scroll = QScrollArea()
         aim_scroll.setWidgetResizable(True)
         aim_scroll.setFrameShape(QFrame.NoFrame)
@@ -645,7 +669,6 @@ class MainWindow(QMainWindow):
         
         v.addWidget(self._card("Aim Assist", aim_scroll))
         
-        # Scan options
         opt = QWidget()
         fo = QFormLayout()
         self.sp_burst = QSpinBox()
@@ -672,12 +695,10 @@ class MainWindow(QMainWindow):
         self.btn_export.clicked.connect(self.export_csv_action)
         v.addWidget(self.btn_export)
         
-        # result - wrap in scroll area
         self.result = QTextEdit()
         self.result.setReadOnly(True)
         self.result.setMinimumHeight(180)
         
-        # Create a scroll area for result section
         result_scroll = QScrollArea()
         result_scroll.setWidgetResizable(True)
         result_scroll.setFrameShape(QFrame.NoFrame)
@@ -691,63 +712,356 @@ class MainWindow(QMainWindow):
         return w
 
     def _build_advanced_dock(self):
-        self.adv_dock = QDockWidget("Advanced", self)
+        """Build Advanced settings dock (removable panel)."""
+        self.adv_dock = QDockWidget("Advanced Settings", self)
+        self.adv_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
         self.addDockWidget(Qt.RightDockWidgetArea, self.adv_dock)
         self.adv_dock.setVisible(False)
+        self.adv_dock.setStyleSheet("""
+            QDockWidget {
+                background: rgba(12, 18, 28, 0.95);
+                border: 1px solid rgba(120, 220, 255, 0.15);
+            }
+            QDockWidget::title {
+                background: rgba(20, 30, 45, 0.8);
+                padding: 10px 14px;
+                font-weight: 700;
+                color: #e8f7ff;
+                border-bottom: 1px solid rgba(120, 220, 255, 0.1);
+            }
+        """)
+
         adv = QWidget()
+        adv.setStyleSheet("background: rgba(15, 22, 35, 0.9);")
         v = QVBoxLayout()
-        
-        # thresholds
-        thr = QGroupBox("Thresholds")
+        v.setContentsMargins(16, 16, 16, 16)
+        v.setSpacing(18)
+
+        # === Calibration Section ===
+        calib_group = QGroupBox("Calibration & Depth Model")
+        calib_group.setStyleSheet("""
+            QGroupBox {
+                color: #e8f7ff;
+                border: 1px solid rgba(120, 220, 255, 0.18);
+                border-radius: 16px;
+                margin-top: 12px;
+                padding: 16px;
+                font-weight: 700;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 12px;
+                padding: 0 8px;
+            }
+        """)
+        calib_layout = QVBoxLayout()
+
+        calib_form = QFormLayout()
+        calib_form.setSpacing(10)
+        calib_form.setLabelAlignment(Qt.AlignRight)
+
+        self.val_slope = QLineEdit("-6.0")
+        self.val_slope.setPlaceholderText("Slope (mm per score unit)")
+        self.val_intercept = QLineEdit("6.0")
+        self.val_intercept.setPlaceholderText("Intercept (mm)")
+
+        validator = QDoubleValidator(-100.0, 100.0, 3)
+        self.val_slope.setValidator(validator)
+        self.val_intercept.setValidator(validator)
+
+        calib_form.addRow("Slope:", self.val_slope)
+        calib_form.addRow("Intercept:", self.val_intercept)
+
+        btn_save_calib = QPushButton("Save Linear Model to Calibration")
+        btn_save_calib.clicked.connect(self._save_linear_calibration)
+        calib_form.addRow("", btn_save_calib)
+
+        calib_layout.addLayout(calib_form)
+        calib_group.setLayout(calib_layout)
+
+        # === Validation Section ===
+        val_group = QGroupBox("Device Validation")
+        val_group.setStyleSheet(calib_group.styleSheet())
+        val_layout = QVBoxLayout()
+        val_layout.setSpacing(12)
+
+        self.tire_id_input = QLineEdit()
+        self.tire_id_input.setPlaceholderText("Tire ID (e.g., TEST-01)")
+        self.manual_depth_input = QLineEdit()
+        self.manual_depth_input.setPlaceholderText("Manual depth (mm)")
+        self.manual_depth_input.setValidator(QDoubleValidator(0.0, 10.0, 2))
+
+        btn_run_val = QPushButton("Run Validation on Current Scan")
+        btn_run_val.setStyleSheet("""
+            QPushButton {
+                background: #8b5cf6;
+                color: white;
+                border: none;
+                padding: 10px;
+                border-radius: 8px;
+                font-weight: 600;
+            }
+            QPushButton:hover { background: #7c3aed; }
+        """)
+        btn_run_val.clicked.connect(self.run_validation_on_current_scan)
+
+        val_layout.addWidget(QLabel("Tire ID:"))
+        val_layout.addWidget(self.tire_id_input)
+        val_layout.addWidget(QLabel("Manual Depth (mm):"))
+        val_layout.addWidget(self.manual_depth_input)
+        val_layout.addWidget(btn_run_val)
+        val_group.setLayout(val_layout)
+
+        # === Quality Thresholds ===
+        thr = QGroupBox("Quality Thresholds")
+        thr.setStyleSheet(calib_group.styleSheet())
         f = QFormLayout()
+        f.setSpacing(14)
+        f.setLabelAlignment(Qt.AlignRight)
+
         self.sp_min_bright = QSpinBox()
         self.sp_min_bright.setRange(0, 255)
         self.sp_min_bright.setValue(int(self.cfg.min_brightness))
+        self.sp_min_bright.setStyleSheet("padding: 8px;")
         self.sp_max_bright = QSpinBox()
         self.sp_max_bright.setRange(0, 255)
         self.sp_max_bright.setValue(int(self.cfg.max_brightness))
+        self.sp_max_bright.setStyleSheet("padding: 8px;")
         self.sp_min_sharp = QSpinBox()
         self.sp_min_sharp.setRange(0, 5000)
         self.sp_min_sharp.setValue(int(self.cfg.min_sharpness))
-        btn_apply = QPushButton("Apply thresholds")
+        self.sp_min_sharp.setStyleSheet("padding: 8px;")
+
+        btn_apply = QPushButton("Apply Thresholds")
+        btn_apply.setStyleSheet("""
+            QPushButton {
+                background: rgba(59, 130, 246, 0.15);
+                border: 1px solid rgba(59, 130, 246, 0.4);
+                color: #9bdcff;
+                padding: 10px;
+                font-weight: 600;
+            }
+            QPushButton:hover {
+                background: rgba(59, 130, 246, 0.25);
+                border: 1px solid rgba(59, 130, 246, 0.6);
+            }
+        """)
         btn_apply.clicked.connect(self.apply_thresholds)
-        f.addRow("Min brightness", self.sp_min_bright)
-        f.addRow("Max brightness", self.sp_max_bright)
-        f.addRow("Min sharpness", self.sp_min_sharp)
-        f.addRow(btn_apply)
+
+        f.addRow("Minimum Brightness:", self.sp_min_bright)
+        f.addRow("Maximum Brightness:", self.sp_max_bright)
+        f.addRow("Minimum Sharpness:", self.sp_min_sharp)
+        f.addRow("", btn_apply)
         thr.setLayout(f)
-        
-        # history
-        hist = QGroupBox("History")
+
+        # === Scan History ===
+        hist = QGroupBox("Scan History")
+        hist.setStyleSheet(thr.styleSheet())
         hv = QVBoxLayout()
+        hv.setSpacing(12)
+
         self.history = QListWidget()
+        self.history.setStyleSheet("""
+            QListWidget {
+                background: rgba(15, 22, 35, 0.85);
+                border: 1px solid rgba(120, 220, 255, 0.18);
+                border-radius: 12px;
+                color: #e8f7ff;
+                padding: 4px;
+            }
+            QListWidget::item {
+                padding: 10px 14px;
+                border-radius: 10px;
+                margin: 3px 0;
+            }
+            QListWidget::item:selected {
+                background: rgba(30, 60, 100, 0.85);
+                border: 1px solid rgba(120, 220, 255, 0.45);
+            }
+        """)
         self.history.itemSelectionChanged.connect(self.on_history_select)
         hv.addWidget(self.history)
-        self.hist_preview = QLabel("Preview")
+
+        self.hist_preview = QLabel("Select a scan to preview processed images")
         self.hist_preview.setMinimumHeight(180)
         self.hist_preview.setAlignment(Qt.AlignCenter)
-        self.hist_preview.setStyleSheet("background:#0b0f14; border-radius:14px; border:1px solid rgba(120,220,255,0.18);")
+        self.hist_preview.setStyleSheet("""
+            QLabel {
+                background: rgba(10, 15, 25, 0.8);
+                border-radius: 14px;
+                border: 1px solid rgba(120, 220, 255, 0.15);
+                color: rgba(232,247,255,0.7);
+                font-size: 14px;
+                padding: 20px;
+            }
+        """)
         hv.addWidget(self.hist_preview)
         hist.setLayout(hv)
-        
+
+        # Assemble
+        v.addWidget(calib_group)
+        v.addWidget(val_group)
         v.addWidget(thr)
         v.addWidget(hist)
         v.addStretch(1)
         adv.setLayout(v)
         self.adv_dock.setWidget(adv)
 
-    # ---------- Wizard nav ----------
+    # ---------- Calibration Methods ----------
+    def _save_linear_calibration(self):
+        """Save linear calibration model to disk."""
+        try:
+            slope = float(self.val_slope.text().strip())
+            intercept = float(self.val_intercept.text().strip())
+        except ValueError:
+            self.toast.show_toast("Invalid slope/intercept values.")
+            return
+
+        if self.calib is None:
+            self.calib = {}
+        self.calib["score_model"] = {
+            "type": "linear",
+            "slope": slope,
+            "intercept": intercept
+        }
+        save_calibration(self.cfg.calibration_path, self.calib)
+        self.toast.show_toast(f"✅ Calibration saved: depth = {slope}×score + {intercept} mm")
+
+    def _score_to_depth_mm(self, score: float) -> float:
+        """Convert score → depth using calibration model or fallback."""
+        # Try calibration.json model
+        if self.calib and "score_model" in self.calib:
+            try:
+                model = self.calib["score_model"]
+                if model.get("type") == "linear":
+                    slope = float(model.get("slope", -6.0))
+                    intercept = float(model.get("intercept", 6.0))
+                    return max(0.0, slope * score + intercept)
+            except Exception as e:
+                print(f"[WARN] Calibration model parse error: {e}")
+
+        # Fallback: UI inputs
+        try:
+            slope = float(self.val_slope.text().strip() or "-6.0")
+            intercept = float(self.val_intercept.text().strip() or "6.0")
+        except ValueError:
+            slope, intercept = -6.0, 6.0
+
+        return max(0.0, slope * score + intercept)
+
+    def _run_validation_core(self) -> Tuple[float, float, str]:
+        """Core validation pipeline. Returns (score, depth_mm, verdict)."""
+        frame = self.video.frame_bgr.copy()
+        roi_bgr = crop_roi(frame, self.roi)
+
+        # Preprocess
+        processed = preprocess_bgr(
+            roi_bgr,
+            clahe_clip=getattr(self.cfg, "clahe_clip", 2.0),
+            clahe_grid=getattr(self.cfg, "clahe_grid", (8, 8))
+        )
+        gray = processed.get("gray")
+        if gray is None:
+            raise RuntimeError("Preprocess failed: no grayscale image")
+
+        # Quality check
+        q = run_quality_checks(gray, self.cfg)
+
+        # Measure
+        edges_for_measure = processed.get("edges_closed", processed.get("edges"))
+        if edges_for_measure is None:
+            raise RuntimeError("No edges found for measurement")
+
+        m = groove_visibility_score(edges_for_measure)
+        device_score = float(m["score"])
+        raw_verdict = pass_fail_from_score(device_score)
+
+        # Convert to depth
+        device_depth = self._score_to_depth_mm(device_score)
+
+        return device_score, device_depth, raw_verdict
+
+    # ---------- Validation Methods ----------
+    def run_validation_on_current_scan(self):
+        """Run validation workflow with current video frame."""
+        if self.video.frame_bgr is None:
+            self.toast.show_toast("No camera frame available.")
+            return
+        if not self.roi:
+            self.toast.show_toast("Please set ROI first.")
+            return
+
+        tire_id = self.tire_id_input.text().strip() or "UNKNOWN"
+        try:
+            manual_mm = float(self.manual_depth_input.text())
+        except ValueError:
+            self.toast.show_toast("Enter a valid manual depth (mm).")
+            return
+
+        t0 = time.perf_counter()
+        try:
+            device_score, device_depth, verdict_raw = self._run_validation_core()
+        except Exception as e:
+            self.toast.show_toast(f"Validation failed: {e}")
+            return
+
+        proc_s = time.perf_counter() - t0
+        abs_error = abs(device_depth - manual_mm)
+        percent_diff = (abs_error / manual_mm) * 100.0 if manual_mm > 0 else 0.0
+
+        # Evaluate criteria
+        pass_pct = percent_diff <= VALIDATION_THRESHOLDS["max_percent_diff"]
+        pass_err = abs_error <= VALIDATION_THRESHOLDS["max_abs_error_mm"]
+        pass_time = proc_s <= VALIDATION_THRESHOLDS["max_processing_time_s"]
+        overall_verdict = "PASS" if (pass_pct and pass_err and pass_time) else "FAIL"
+
+        # Save to DB
+        insert_validation_result(self.cfg, {
+            "ts": time.strftime("%Y%m%d_%H%M%S"),
+            "tire_id": tire_id,
+            "manual_depth": manual_mm,
+            "device_score": device_score,
+            "device_depth": device_depth,
+            "percent_diff": percent_diff,
+            "abs_error_mm": abs_error,
+            "processing_time": proc_s,
+            "verdict": overall_verdict,
+            "notes": f"Raw Verdict: {verdict_raw} | Criteria: avg%≤5, err≤0.5mm, time≤5s"
+        })
+
+        # Display results
+        self.result.clear()
+        self.result.append(f"<h3 style='margin:0;color:{'#10b981' if overall_verdict == 'PASS' else '#ef4444'};'>Validation: {overall_verdict}</h3>")
+        self.result.append(f"<b>Tire ID:</b> {tire_id}")
+        self.result.append(f"<b>Manual:</b> {manual_mm:.2f} mm")
+        self.result.append(f"<b>Device:</b> {device_depth:.2f} mm")
+        self.result.append(f"<b>Abs Error:</b> {abs_error:.3f} mm")
+        self.result.append(f"<b>% Diff:</b> {percent_diff:.2f}%")
+        self.result.append(f"<b>Proc Time:</b> {proc_s:.3f} s")
+        self.result.append(f"<b>Raw CV Verdict:</b> {verdict_raw}")
+
+        # Toast with status
+        color = "#10b981" if overall_verdict == "PASS" else "#ef4444"
+        msg = f"{'✅' if overall_verdict == 'PASS' else '❌'} {overall_verdict} | {tire_id} | Δ={abs_error:.3f}mm ({percent_diff:.2f}%)"
+        self.toast.show_toast(msg)
+
+    def export_validation_action(self):
+        """Export validation summary to CSV."""
+        p = export_validation_summary(self.cfg)
+        QMessageBox.information(self, "Validation Export", f"Exported: {p}")
+
+    # ---------- Navigation & Lifecycle ----------
     def _update_nav_buttons(self):
+        """Update navigation button states."""
         idx = self.steps.currentIndex()
         self.btn_back.setEnabled(idx > 0)
         self.btn_next.setEnabled(idx < self.steps.count() - 1)
-        # smart labeling
         labels = ["Camera", "ROI", "Calibrate", "Scan"]
         self.btn_next.setText(("Next → " + labels[idx+1]) if idx < 3 else "Done")
 
     def next_step(self):
+        """Move to next wizard step."""
         idx = self.steps.currentIndex()
-        # soft validation per step
         if idx == 0 and self.cap is None:
             self.toast.show_toast("Open a camera first.")
             return
@@ -759,39 +1073,51 @@ class MainWindow(QMainWindow):
             self._update_nav_buttons()
 
     def prev_step(self):
+        """Move to previous wizard step."""
         idx = self.steps.currentIndex()
         if idx > 0:
             self.steps.setCurrentIndex(idx - 1)
             self._update_nav_buttons()
 
-    # ---------- Camera ----------
-    def _open_camera(self, force_index=None):
+    # ---------- Camera Management ----------
+    def _open_camera(self, force_index: Optional[int] = None):
+        """Open camera with specified index."""
         pref = force_index if force_index is not None else self.cfg.cam_index
-        self.cap, self.cam_index = open_camera(pref, self.cfg.width, self.cfg.height, self.cfg.fps)
-        self.toast.show_toast(f"Camera opened (index={self.cam_index})")
-        self.chip.set_state("ready", "READY")
+        try:
+            self.cap, self.cam_index = open_camera(pref, self.cfg.width, self.cfg.height, self.cfg.fps)
+            self.toast.show_toast(f"✅ Camera opened (index={self.cam_index})")
+            self.chip.set_state("ready", "READY")
+        except Exception as e:
+            self.toast.show_toast(f"❌ Camera error: {e}")
+            self.chip.set_state("fail", "NO CAM")
 
     def reopen_camera(self):
-        idx = int(self.cam_idx.currentText())
-        preset = self.res_combo.currentText()
-        for name, w, h in RES_PRESETS:
-            if name == preset:
-                self.cfg.width = w
-                self.cfg.height = h
-        if self.cap:
-            self.cap.release()
-        self._open_camera(force_index=idx)
+        """Reopen camera with new settings."""
+        try:
+            idx = int(self.cam_idx.currentText())
+            preset = self.res_combo.currentText()
+            for name, w, h in RES_PRESETS:
+                if name == preset:
+                    self.cfg.width = w
+                    self.cfg.height = h
+            if self.cap:
+                self.cap.release()
+            self._open_camera(force_index=idx)
+        except Exception as e:
+            self.toast.show_toast(f"Camera reopen failed: {e}")
 
     def _tick(self):
+        """Main application loop (15ms)."""
         if not self.cap:
             return
+        
         ok, frame = self.cap.read()
         if not ok or frame is None:
             return
+        
         self.video.set_frame(frame, roi=self.roi)
         
-        # Live ROI metrics (Aim Assist + Auto-trigger)
-        # useful for accurate detection and auto-trigger
+        # Live metrics
         if self.roi is not None:
             t = time.monotonic()
             if (t - self._metrics_last_t) >= 0.10:
@@ -808,18 +1134,18 @@ class MainWindow(QMainWindow):
                     self.prev_roi_gray = roi_gray
                     self.live_last = live
                     
-                    # Update Aim Assist box if it exists
                     if hasattr(self, 'aim_box'):
-                        msg = []
-                        msg.append(f"Brightness: {live.brightness:.1f}  (target {self.cfg.min_brightness:.0f}-{self.cfg.max_brightness:.0f})")
-                        msg.append(f"Sharpness:  {live.sharpness:.1f}  (min {self.cfg.min_sharpness:.0f})")
-                        msg.append(f"Glare:      {live.glare_ratio*100:.1f}% (lower is better)")
-                        msg.append(f"Stability:  {live.stability:.2f} (lower is better)")
-                        msg.append("")
-                        msg.append("Hint: " + ("READY TO CAPTURE" if live.ok_hint else "Adjust angle/light/hold steady"))
+                        msg = [
+                            f"Brightness: {live.brightness:.1f}  (target {self.cfg.min_brightness:.0f}-{self.cfg.max_brightness:.0f})",
+                            f"Sharpness:  {live.sharpness:.1f}  (min {self.cfg.min_sharpness:.0f})",
+                            f"Glare:      {live.glare_ratio*100:.1f}% (lower is better)",
+                            f"Stability:  {live.stability:.2f} (lower is better)",
+                            "",
+                            "Hint: " + ("READY TO CAPTURE" if live.ok_hint else "Adjust angle/light/hold steady")
+                        ]
                         self.aim_box.setPlainText("\n".join(msg))
                     
-                    # Auto-trigger: only on Scan step
+                    # Auto-trigger
                     if self.auto_trigger_enabled and self.steps.currentIndex() == 3:
                         if live.ok_hint:
                             self.stable_ok_frames += 1
@@ -836,12 +1162,12 @@ class MainWindow(QMainWindow):
                             self._auto_last_capture_t = now
                             self.toast.show_toast("Auto-trigger capture…")
                             self.capture_analyze()
-                except Exception:
-                    # avoid crashing the UI loop
-                    pass
+                except Exception as e:
+                    print(f"[WARN] Metrics update failed: {e}")
 
-    # ---------- ROI ----------
+    # ---------- ROI Management ----------
     def _update_roi_info(self):
+        """Update ROI info display."""
         if not hasattr(self, "roi_info"):
             return
         if not self.roi:
@@ -856,24 +1182,31 @@ class MainWindow(QMainWindow):
         self.roi_info.setText(msg)
 
     def toggle_roi_mode(self):
+        """Enable ROI drag mode."""
         self.video.set_modes(roi_mode=True, calib_mode=False)
         self.toast.show_toast("ROI mode: drag a rectangle on the video")
 
     def clear_roi(self):
+        """Clear ROI selection."""
         self.roi = None
         self.video.roi = None
         self._update_roi_info()
         self.toast.show_toast("ROI cleared")
 
     def auto_roi(self):
+        """Auto-detect ROI."""
         if self.video.frame_bgr is None:
             return
-        self.roi = clamp_roi(suggest_roi(self.video.frame_bgr), self.video.frame_bgr.shape)
-        self.video.set_frame(self.video.frame_bgr, roi=self.roi)
-        self._update_roi_info()
-        self.toast.show_toast("Auto ROI set")
+        try:
+            self.roi = clamp_roi(suggest_roi(self.video.frame_bgr), self.video.frame_bgr.shape)
+            self.video.set_frame(self.video.frame_bgr, roi=self.roi)
+            self._update_roi_info()
+            self.toast.show_toast("✅ Auto ROI set")
+        except Exception as e:
+            self.toast.show_toast(f"Auto ROI failed: {e}")
 
     def on_roi_drag_finished(self):
+        """Handle ROI drag completion."""
         if self.video.frame_bgr is None or not self.video.drag_start or not self.video.drag_end:
             return
         x0, y0 = self.video.drag_start
@@ -897,49 +1230,59 @@ class MainWindow(QMainWindow):
         self.roi = clamp_roi({"x": x, "y": y, "w": w, "h": h}, self.video.frame_bgr.shape)
         self.video.set_modes(False, False)
         self._update_roi_info()
-        self.toast.show_toast(f"ROI set ({w}×{h})")
+        self.toast.show_toast(f"✅ ROI set ({w}×{h})")
 
-    # ---------- Calibration ----------
+    # ---------- Calibration Management ----------
     def toggle_calibration(self):
+        """Enable calibration mode."""
         self.video.set_modes(roi_mode=False, calib_mode=True)
         self.toast.show_toast("Calibration: click 2 points with known distance")
 
     def on_calib_clicks_changed(self):
+        """Handle calibration points entered."""
         if len(self.video.calib_points) == 2:
             from PySide6.QtWidgets import QInputDialog
             mm, ok = QInputDialog.getDouble(self, "Calibration", "Enter known distance (mm):", 10.0, 0.001, 10000.0, 3)
             if not ok:
                 self.video.calib_points = []
                 return
-            p0 = self.video._widget_to_frame(*self.video.calib_points[0])
-            p1 = self.video._widget_to_frame(*self.video.calib_points[1])
-            px_per_mm, mm_per_px = compute_scale_from_two_points(p0, p1, float(mm))
-            self.calib = {"px_per_mm": px_per_mm, "mm_per_px": mm_per_px, "method": "two_point"}
-            save_calibration(self.cfg.calibration_path, self.calib)
-            self.cal_label.setText(self._calib_text())
-            self.video.set_modes(False, False)
-            self.toast.show_toast("Calibration saved")
+            try:
+                p0 = self.video._widget_to_frame(*self.video.calib_points[0])
+                p1 = self.video._widget_to_frame(*self.video.calib_points[1])
+                px_per_mm, mm_per_px = compute_scale_from_two_points(p0, p1, float(mm))
+                self.calib = {"px_per_mm": px_per_mm, "mm_per_px": mm_per_px, "method": "two_point"}
+                save_calibration(self.cfg.calibration_path, self.calib)
+                self.cal_label.setText(self._calib_text())
+                self.video.set_modes(False, False)
+                self.toast.show_toast("✅ Calibration saved")
+            except Exception as e:
+                self.toast.show_toast(f"Calibration failed: {e}")
+                self.video.calib_points = []
 
     def clear_calibration(self):
+        """Clear calibration data."""
         self.calib = {"px_per_mm": None, "mm_per_px": None, "method": None}
         save_calibration(self.cfg.calibration_path, self.calib)
         self.cal_label.setText(self._calib_text())
         self.toast.show_toast("Calibration cleared")
 
-    def _calib_text(self):
-        if self.calib.get("mm_per_px"):
+    def _calib_text(self) -> str:
+        """Generate calibration status text."""
+        if self.calib and self.calib.get("mm_per_px"):
             return f"Scale: {self.calib['mm_per_px']:.6f} mm/px ({self.calib['px_per_mm']:.2f} px/mm)"
         return "Scale: not calibrated"
 
-    # ---------- Thresholds ----------
+    # ---------- Threshold Management ----------
     def apply_thresholds(self):
+        """Apply new quality thresholds."""
         self.cfg.min_brightness = float(self.sp_min_bright.value())
         self.cfg.max_brightness = float(self.sp_max_bright.value())
         self.cfg.min_sharpness = float(self.sp_min_sharp.value())
-        self.toast.show_toast("Thresholds applied")
+        self.toast.show_toast("✅ Thresholds applied")
 
-    # ---------- Capture ----------
+    # ---------- Capture & Analysis ----------
     def capture_analyze(self):
+        """Full capture and analysis workflow."""
         if self._capture_busy:
             return
         self._capture_busy = True
@@ -950,23 +1293,23 @@ class MainWindow(QMainWindow):
             if not self.roi:
                 self.toast.show_toast("Set ROI first.")
                 return
-            
-            # Burst capture for reliability
+
+            t0 = time.perf_counter()
+
+            # Burst capture
             burst_n = self.sp_burst.value() if hasattr(self, 'sp_burst') else 1
             frames = []
             if burst_n <= 1:
-                frame = self.video.frame_bgr.copy()
-                frames = [frame]
+                frames = [self.video.frame_bgr.copy()]
             else:
-                # grab burst_n frames from camera (fallback to last frame if needed)
                 for _ in range(burst_n):
                     ok, fr = self.cap.read() if self.cap else (False, None)
                     if ok and fr is not None:
                         frames.append(fr)
                 if not frames:
                     frames = [self.video.frame_bgr.copy()]
-            
-            # pick best frame by quality: sharpness high, glare low
+
+            # Select best frame
             best = frames[0]
             best_score = -1e18
             prevg = None
@@ -980,18 +1323,17 @@ class MainWindow(QMainWindow):
                         min_sharpness=self.cfg.min_sharpness,
                     )
                     prevg = g
-                    # heuristic score: prefer sharpness, penalize glare + instability
                     score = (live.sharpness * 1.0) - (live.glare_ratio * 800.0) - (live.stability * 25.0)
                     if score > best_score:
                         best_score = score
                         best = fr
                 except Exception:
                     continue
-            
+
             frame = best.copy()
             roi_bgr = crop_roi(frame, self.roi)
-            
-            # --- normalize CLAHE config safely (handles int/list/tuple/None) ---
+
+            # Preprocess
             grid = getattr(self.cfg, "clahe_grid", (8, 8))
             if isinstance(grid, int):
                 grid = (grid, grid)
@@ -999,41 +1341,28 @@ class MainWindow(QMainWindow):
                 grid = (int(grid[0]), int(grid[1]))
             else:
                 grid = (8, 8)
-            clip = getattr(self.cfg, "clahe_clip", 2.0)
-            try:
-                clip = float(clip)
-            except Exception:
-                clip = 2.0
-            
+
+            clip = float(getattr(self.cfg, "clahe_clip", 2.0))
             processed = preprocess_bgr(roi_bgr, clahe_clip=clip, clahe_grid=grid)
-            
-            # --- required outputs ---
             gray = processed.get("gray")
             if gray is None:
-                self.toast.show_toast("Preprocess failed: missing gray output.")
+                self.toast.show_toast("Preprocess failed.")
                 return
+
+            # Quality
             q = run_quality_checks(gray, self.cfg)
-            
-            # --- edges_closed is optional; fallback to edges ---
-            edges_for_measure = processed.get("edges_closed", None)
+
+            # Measure
+            edges_for_measure = processed.get("edges_closed", processed.get("edges"))
             if edges_for_measure is None:
-                edges_for_measure = processed.get("edges", None)
-            if edges_for_measure is None:
-                self.toast.show_toast("No edges found; check preprocess.")
+                self.toast.show_toast("No edges found.")
                 return
-            
+
             m = groove_visibility_score(edges_for_measure)
             verdict = pass_fail_from_score(m["score"])
-            
-            # chip state
-            if q["ok"] and verdict.upper().startswith("PASS"):
-                self.chip.set_state("ok", "OK")
-            elif not q["ok"] and verdict.upper().startswith("PASS"):
-                self.chip.set_state("warn", "WARN")
-            else:
-                self.chip.set_state("fail", "FAIL")
-            
-            meta = {
+
+            # Save
+            ts, img_path, _meta_path = save_capture(self.cfg, frame, {
                 "camera_index": self.cam_index,
                 "roi": self.roi,
                 "quality": q,
@@ -1041,22 +1370,22 @@ class MainWindow(QMainWindow):
                 "verdict": verdict,
                 "session": {
                     "vehicle_id": self.in_vehicle.text().strip() or None,
-                    "tire_position": self.in_tirepos.currentText(),
+                    "tire_position": self.in_tirepos.currentText().strip() or None,
                     "operator": self.in_operator.text().strip() or None,
                     "notes": self.in_notes.text().strip() or None,
                 },
                 "calibration": self.calib,
-                "config": asdict(self.cfg),
-            }
-            
-            ts, img_path, meta_path = save_capture(self.cfg, frame, meta)
-            out_paths = save_processed(self.cfg, ts, processed)
-            
+            })
+            save_processed(self.cfg, ts, processed)
+
+            mm_per_px = self.calib.get("mm_per_px") if isinstance(self.calib, dict) else None
             insert_result(self.cfg, {
                 "ts": ts,
                 "image_path": str(img_path),
-                "roi_x": int(self.roi["x"]), "roi_y": int(self.roi["y"]),
-                "roi_w": int(self.roi["w"]), "roi_h": int(self.roi["h"]),
+                "roi_x": int(self.roi["x"]),
+                "roi_y": int(self.roi["y"]),
+                "roi_w": int(self.roi["w"]),
+                "roi_h": int(self.roi["h"]),
                 "brightness": float(q["metrics"]["brightness"]),
                 "glare_ratio": float(q["metrics"]["glare_ratio"]),
                 "sharpness": float(q["metrics"]["sharpness"]),
@@ -1064,86 +1393,106 @@ class MainWindow(QMainWindow):
                 "continuity": float(m["continuity"]),
                 "score": float(m["score"]),
                 "verdict": verdict,
-                "notes": "; ".join(q["reasons"]) if not q["ok"] else "",
+                "notes": "; ".join(q["reasons"]) if q.get("reasons") else "",
                 "vehicle_id": self.in_vehicle.text().strip() or None,
-                "tire_position": self.in_tirepos.currentText(),
+                "tire_position": self.in_tirepos.currentText().strip() or None,
                 "operator": self.in_operator.text().strip() or None,
                 "session_notes": self.in_notes.text().strip() or None,
-                "mm_per_px": float(self.calib["mm_per_px"]) if self.calib.get("mm_per_px") else None
+                "mm_per_px": float(mm_per_px) if mm_per_px else None,
             })
-            
-            # clean readable result
+
+            proc_s = time.perf_counter() - t0
             self.result.clear()
-            self.result.append(f"<h3 style='margin:0;'>Verdict: {verdict}</h3>")
-            self.result.append(f"<b>Score:</b> {m['score']:.4f}")
-            self.result.append(f"<b>Quality:</b> {'OK' if q['ok'] else 'FAIL'}")
-            if q["reasons"]:
-                self.result.append("<b>Issues:</b>")
-                for r in q["reasons"]:
-                    self.result.append(f"• {r}")
-            if self.calib.get("mm_per_px"):
-                self.result.append(f"<b>Scale:</b> {self.calib['mm_per_px']:.6f} mm/px")
-            
-            self.toast.show_toast(f"Saved scan {ts}")
+            self.result.append(f"<h3 style='margin:0;'>Scan: {verdict}</h3>")
+            self.result.append(f"<b>TS:</b> {ts}")
+            self.result.append(f"<b>Score:</b> {float(m['score']):.6f}")
+            self.result.append(f"<b>Edge Density:</b> {float(m['edge_density']):.6f}")
+            self.result.append(f"<b>Continuity:</b> {float(m['continuity']):.3f}")
+            self.result.append(f"<b>Processing:</b> {proc_s:.3f} s")
+            if q.get("reasons"):
+                self.result.append("<b>Quality Notes:</b> " + "; ".join(q["reasons"]))
+
+            if verdict == "GOOD":
+                self.chip.set_state("ok", "GOOD")
+            elif verdict == "WARNING":
+                self.chip.set_state("warn", "WARN")
+            else:
+                self.chip.set_state("fail", "REPLACE")
+
             self._refresh_history()
+            self.toast.show_toast(f"✅ Saved {ts} | {verdict}")
+
         except Exception as e:
             self.toast.show_toast(f"Capture failed: {e}")
             self.chip.set_state("fail", "FAIL")
-            raise
         finally:
             self._capture_busy = False
 
-    # implementation on auto trigger
-    def _on_auto_trigger_changed(self, text):
+    def _on_auto_trigger_changed(self, text: str):
+        """Handle auto-trigger toggle."""
         self.auto_trigger_enabled = (text.strip().lower() == "on")
         self.stable_ok_frames = 0
         self.toast.show_toast("Auto-trigger ON" if self.auto_trigger_enabled else "Auto-trigger OFF")
 
-    # export for csv action
     def export_csv_action(self):
-        p = export_csv(self.cfg)
-        QMessageBox.information(self, "Export CSV", f"Exported: {p}")
+        """Export results to CSV."""
+        try:
+            p = export_csv(self.cfg)
+            QMessageBox.information(self, "Export CSV", f"✅ Exported: {p}")
+        except Exception as e:
+            QMessageBox.critical(self, "Export Error", str(e))
 
-    # _refresh-his
+    # ---------- History Management ----------
     def _refresh_history(self):
+        """Refresh scan history list."""
         if not hasattr(self, "history"):
             return
         self.history.blockSignals(True)
         self.history.clear()
-        items = list_results(self.cfg, limit=30)
-        for it in items:
-            self.history.addItem(f"{it['ts']} | {it['verdict']} | {it['score']:.4f}")
+        try:
+            items = list_results(self.cfg, limit=30)
+            for it in items:
+                self.history.addItem(f"{it['ts']} | {it['verdict']} | {it['score']:.4f}")
+        except Exception as e:
+            print(f"[WARN] History refresh failed: {e}")
         self.history.blockSignals(False)
 
-    # ---------- History ----------
     def on_history_select(self):
+        """Display selected scan preview."""
         if not self.history.selectedItems():
             return
         ts = self.history.selectedItems()[0].text().split("|")[0].strip()
-        row = get_result_by_ts(self.cfg, ts)
-        if not row:
-            return
-        paths = find_processed_images(self.cfg, ts)
-        candidate = None
-        for key in ("gray", "edges_closed", "edges"):
-            if key in paths:
-                candidate = paths[key]
-                break
-        if candidate:
-            img = cv2.imread(str(candidate))
-            if img is not None:
-                qimg = bgr_to_qimage(img)
-                pix = QPixmap.fromImage(qimg).scaled(self.hist_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                self.hist_preview.setPixmap(pix)
+        try:
+            row = get_result_by_ts(self.cfg, ts)
+            if not row:
+                return
+            paths = find_processed_images(self.cfg, ts)
+            candidate = None
+            for key in ("gray", "edges_closed", "edges"):
+                if key in paths:
+                    candidate = paths[key]
+                    break
+            if candidate:
+                img = cv2.imread(str(candidate))
+                if img is not None:
+                    qimg = bgr_to_qimage(img)
+                    pix = QPixmap.fromImage(qimg).scaled(
+                        self.hist_preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation
+                    )
+                    self.hist_preview.setPixmap(pix)
+        except Exception as e:
+            print(f"[WARN] History select failed: {e}")
 
-    # ---------- Advanced ----------
+    # ---------- Advanced Panel ----------
     def toggle_advanced(self):
+        """Toggle advanced settings dock."""
         vis = not self.adv_dock.isVisible()
         self.adv_dock.setVisible(vis)
         if vis:
             self._refresh_history()
 
 def run_app(cfg):
+    """Launch the TireGuard application."""
     app = QApplication(sys.argv)
     w = MainWindow(cfg)
     w.show()

@@ -1,0 +1,38 @@
+{
+  "ts": "20260218_080804",
+  "camera_index": 0,
+  "roi": {
+    "x": 0,
+    "y": 0,
+    "w": 288,
+    "h": 216
+  },
+  "quality": {
+    "ok": false,
+    "reasons": [
+      "Too blurry (sharpness=3.1)"
+    ],
+    "metrics": {
+      "brightness": 41.82171103395062,
+      "glare_ratio": 0.0,
+      "sharpness": 3.0862334999384617
+    }
+  },
+  "measure": {
+    "edge_density": 0.0,
+    "continuity": 0.0,
+    "score": 0.0
+  },
+  "verdict": "REPLACE",
+  "session": {
+    "vehicle_id": null,
+    "tire_position": "FL",
+    "operator": null,
+    "notes": null
+  },
+  "calibration": {
+    "px_per_mm": 21.162703040963365,
+    "mm_per_px": 0.047252942975401606,
+    "method": "two_point"
+  }
+}

@@ -76,6 +76,24 @@ def init_db(cfg):
         if not _col_exists(cur, "results", col):
             cur.execute(f"ALTER TABLE results ADD COLUMN {col} {typ}")
 
+    # NEW: validation table
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS validation_results (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT NOT NULL,
+        tire_id TEXT,
+        manual_depth REAL NOT NULL,
+        device_score REAL NOT NULL,
+        device_depth REAL,
+        percent_diff REAL,
+        abs_error_mm REAL,
+        processing_time REAL,
+        verdict TEXT,
+        notes TEXT,
+        created_at TEXT DEFAULT (datetime('now'))
+    )
+    """)
+
     con.commit()
     con.close()
 
@@ -136,6 +154,28 @@ def insert_result(cfg, row: dict):
     cur.execute(sql, vals)
     con.commit()
     con.close()
+
+def insert_validation_result(cfg, row: dict):
+    con = sqlite3.connect(cfg.db_path)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+
+    cur.execute("PRAGMA table_info(validation_results)")
+    cols_in_db = {r["name"] for r in cur.fetchall()}
+
+    clean = {k: row.get(k) for k in row.keys() if k in cols_in_db}
+    if "ts" not in clean:
+        clean["ts"] = now_ts()
+
+    cols = list(clean.keys())
+    vals = [clean[c] for c in cols]
+    placeholders = ", ".join(["?"] * len(cols))
+
+    sql = f"INSERT INTO validation_results ({', '.join(cols)}) VALUES ({placeholders})"
+    cur.execute(sql, vals)
+    con.commit()
+    con.close()
+
 
 def list_results(cfg, limit=30, vehicle_id=None, tire_position=None, verdict=None):
     con = sqlite3.connect(cfg.db_path)
@@ -244,3 +284,71 @@ def export_csv(cfg):
             w.writerow([rd.get(c, "") if rd.get(c, None) is not None else "" for c in COLUMNS])
 
     return cfg.export_csv_path
+
+def list_validation_results(cfg, limit=50, tire_id=None, verdict=None):
+    con = sqlite3.connect(cfg.db_path)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+
+    where = []
+    params = []
+
+    if tire_id:
+        where.append("tire_id = ?")
+        params.append(tire_id)
+    if verdict:
+        where.append("verdict = ?")
+        params.append(verdict)
+
+    where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+    cur.execute(f"""
+        SELECT
+            id, ts, tire_id, manual_depth, device_score, device_depth,
+            percent_diff, abs_error_mm, processing_time, verdict, notes, created_at
+        FROM validation_results
+        {where_sql}
+        ORDER BY id DESC
+        LIMIT ?
+    """, (*params, int(limit)))
+    rows = [dict(r) for r in cur.fetchall()]
+    con.close()
+    return rows
+
+
+def export_validation_summary(cfg):
+    import csv
+
+    con = sqlite3.connect(cfg.db_path)
+    cur = con.cursor()
+    cur.execute("""
+        SELECT
+            tire_id, created_at, device_depth, manual_depth,
+            percent_diff, processing_time, verdict
+        FROM validation_results
+        ORDER BY id ASC
+    """)
+    rows = cur.fetchall()
+    con.close()
+
+    out_path = cfg.data_dir / "validation_summary_table3_2.csv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(out_path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow([
+            "Trial Number", "Date and Time",
+            "Device Prototype Reading (mm)", "Traditional Tread Depth Gauge Reading (mm)",
+            "Percentage Difference (%)", "Processing Time (s)", "Verdict"
+        ])
+        for tire_id, created_at, device_depth, manual_depth, percent_diff, processing_time, v in rows:
+            w.writerow([
+                tire_id or "",
+                created_at or "",
+                round(float(device_depth), 2) if device_depth is not None else "",
+                round(float(manual_depth), 2) if manual_depth is not None else "",
+                round(float(percent_diff), 2) if percent_diff is not None else "",
+                round(float(processing_time), 2) if processing_time is not None else "",
+                v or "",
+            ])
+
+    return out_path
