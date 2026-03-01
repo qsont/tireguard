@@ -42,6 +42,10 @@ VALIDATION_THRESHOLDS = {
     "max_processing_time_s": 5.0, # ≤5s processing time acceptable
 }
 
+PSI_DEFAULT_RECOMMENDED = 32.0
+PSI_GOOD_DELTA = 1.5
+PSI_WARN_DELTA = 3.0
+
 # ---------- Helper Functions ----------
 def bgr_to_qimage(bgr: np.ndarray) -> QImage:
     """Convert OpenCV BGR image to QImage for display."""
@@ -641,10 +645,22 @@ class MainWindow(QMainWindow):
         self.in_tirepos = QComboBox()
         self.in_tirepos.addItems(["FL","FR","RL","RR","SPARE"])
         self.in_notes = QLineEdit()
+
+        self.in_psi_measured = QLineEdit()
+        self.in_psi_measured.setPlaceholderText("Measured PSI (e.g., 31.5)")
+        self.in_psi_recommended = QLineEdit()
+        self.in_psi_recommended.setPlaceholderText("Recommended PSI (default 32.0)")
+
+        psi_validator = QDoubleValidator(0.0, 120.0, 1)
+        self.in_psi_measured.setValidator(psi_validator)
+        self.in_psi_recommended.setValidator(psi_validator)
+
         f.addRow("Vehicle ID", self.in_vehicle)
         f.addRow("Tire", self.in_tirepos)
         f.addRow("Operator", self.in_operator)
         f.addRow("Notes", self.in_notes)
+        f.addRow("Measured PSI", self.in_psi_measured)
+        f.addRow("Recommended PSI", self.in_psi_recommended)
         sess.setLayout(f)
         
         sess_scroll = QScrollArea()
@@ -1280,6 +1296,32 @@ class MainWindow(QMainWindow):
         self.cfg.min_sharpness = float(self.sp_min_sharp.value())
         self.toast.show_toast("✅ Thresholds applied")
 
+    def _to_float_or_none(self, text: str) -> Optional[float]:
+        try:
+            t = (text or "").strip()
+            if not t:
+                return None
+            return float(t)
+        except Exception:
+            return None
+
+    def _psi_verdict(self, measured: Optional[float], recommended: Optional[float]) -> str:
+        # Missing PSI is neutral for combined verdict
+        if measured is None:
+            return "GOOD"
+        rec = recommended if (recommended is not None and recommended > 0) else PSI_DEFAULT_RECOMMENDED
+        delta = abs(float(measured) - float(rec))
+        if delta <= PSI_GOOD_DELTA:
+            return "GOOD"
+        if delta <= PSI_WARN_DELTA:
+            return "WARNING"
+        return "REPLACE"
+
+    def _combine_verdicts(self, tread_verdict: str, psi_verdict: str) -> str:
+        sev = {"GOOD": 0, "WARNING": 1, "REPLACE": 2}
+        inv = {0: "GOOD", 1: "WARNING", 2: "REPLACE"}
+        return inv[max(sev.get(tread_verdict, 2), sev.get(psi_verdict, 0))]
+
     # ---------- Capture & Analysis ----------
     def capture_analyze(self):
         """Full capture and analysis workflow."""
@@ -1359,7 +1401,12 @@ class MainWindow(QMainWindow):
                 return
 
             m = groove_visibility_score(edges_for_measure)
-            verdict = pass_fail_from_score(m["score"])
+            tread_verdict = pass_fail_from_score(m["score"])
+
+            psi_measured = self._to_float_or_none(self.in_psi_measured.text()) if hasattr(self, "in_psi_measured") else None
+            psi_recommended = self._to_float_or_none(self.in_psi_recommended.text()) if hasattr(self, "in_psi_recommended") else None
+            psi_status = self._psi_verdict(psi_measured, psi_recommended)
+            verdict = self._combine_verdicts(tread_verdict, psi_status)
 
             # Save
             ts, img_path, _meta_path = save_capture(self.cfg, frame, {
@@ -1368,6 +1415,12 @@ class MainWindow(QMainWindow):
                 "quality": q,
                 "measure": m,
                 "verdict": verdict,
+                "tread_verdict": tread_verdict,
+                "psi": {
+                    "measured": psi_measured,
+                    "recommended": psi_recommended if psi_recommended is not None else PSI_DEFAULT_RECOMMENDED,
+                    "status": psi_status,
+                },
                 "session": {
                     "vehicle_id": self.in_vehicle.text().strip() or None,
                     "tire_position": self.in_tirepos.currentText().strip() or None,
@@ -1392,7 +1445,11 @@ class MainWindow(QMainWindow):
                 "edge_density": float(m["edge_density"]),
                 "continuity": float(m["continuity"]),
                 "score": float(m["score"]),
-                "verdict": verdict,
+                "verdict": verdict,              # combined verdict
+                "tread_verdict": tread_verdict,  # raw tread verdict
+                "psi_measured": float(psi_measured) if psi_measured is not None else None,
+                "psi_recommended": float(psi_recommended) if psi_recommended is not None else PSI_DEFAULT_RECOMMENDED,
+                "psi_status": psi_status,
                 "notes": "; ".join(q["reasons"]) if q.get("reasons") else "",
                 "vehicle_id": self.in_vehicle.text().strip() or None,
                 "tire_position": self.in_tirepos.currentText().strip() or None,
@@ -1405,6 +1462,12 @@ class MainWindow(QMainWindow):
             self.result.clear()
             self.result.append(f"<h3 style='margin:0;'>Scan: {verdict}</h3>")
             self.result.append(f"<b>TS:</b> {ts}")
+            self.result.append(f"<b>Tread Verdict:</b> {tread_verdict}")
+            if psi_measured is not None:
+                rec = psi_recommended if psi_recommended is not None else PSI_DEFAULT_RECOMMENDED
+                self.result.append(f"<b>PSI:</b> {psi_measured:.1f} (rec {rec:.1f}) → {psi_status}")
+            else:
+                self.result.append("<b>PSI:</b> not provided (neutral)")
             self.result.append(f"<b>Score:</b> {float(m['score']):.6f}")
             self.result.append(f"<b>Edge Density:</b> {float(m['edge_density']):.6f}")
             self.result.append(f"<b>Continuity:</b> {float(m['continuity']):.3f}")

@@ -20,6 +20,7 @@ except Exception:
 
 from .config import AppConfig
 from .storage import (
+    init_db,  # added
     list_results, get_result_by_ts, export_csv, find_processed_images,
     list_validation_results, export_validation_summary
 )
@@ -985,6 +986,9 @@ def index():
               <th>Sharpness</th>
               <th>Edge Density</th>
               <th>Continuity</th>
+              <th>PSI Measured</th>
+              <th>PSI Recommended</th>
+              <th>PSI Status</th>
             </tr>
           </thead>
           <tbody id="tbody"></tbody>
@@ -1037,6 +1041,22 @@ def index():
           <div class="info-item">
             <div class="info-label">Continuity</div>
             <div class="info-value" id="selContinuity">—</div>
+          </div>
+          <div class="info-item">
+            <div class="info-label">Tread Verdict</div>
+            <div class="info-value" id="selTreadVerdict">—</div>
+          </div>
+          <div class="info-item">
+            <div class="info-label">PSI Measured</div>
+            <div class="info-value" id="selPsiMeasured">—</div>
+          </div>
+          <div class="info-item">
+            <div class="info-label">PSI Recommended</div>
+            <div class="info-value" id="selPsiRecommended">—</div>
+          </div>
+          <div class="info-item">
+            <div class="info-label">PSI Status</div>
+            <div class="info-value" id="selPsiStatus">—</div>
           </div>
           <div class="info-item">
             <div class="info-label">Notes</div>
@@ -1209,6 +1229,12 @@ def index():
       return "verdict-fail";
     }
 
+    // Safe numeric formatter for nullable/string values
+    function nfmt(v, digits = 2, fallback = "—") {
+      const n = Number(v);
+      return Number.isFinite(n) ? n.toFixed(digits) : fallback;
+    }
+
     async function api(path) {
       const res = await fetch(path);
       if (!res.ok) throw new Error(await res.text());
@@ -1272,7 +1298,7 @@ def index():
         if (filtered.length === 0) {
           tbody.innerHTML = `
             <tr>
-              <td colspan="10" style="text-align: center; padding: 2rem; color: #6c757d;">
+              <td colspan="13" style="text-align: center; padding: 2rem; color: #6c757d;">
                 <i class="fas fa-search" style="font-size: 2rem; margin-bottom: 1rem; opacity: 0.3;"></i>
                 <p>No scans match your criteria</p>
                 <button id="resetFilters" class="btn btn-outline" style="margin-top: 1rem;">
@@ -1310,6 +1336,9 @@ def index():
             const sharpness = get("sharpness", "-");
             const edgeDensity = get("edge_density", "-");
             const continuity = get("continuity", "-");
+            const psiMeasured = row.psi_measured == null ? "—" : Number(row.psi_measured).toFixed(1);
+            const psiRec = row.psi_recommended == null ? "—" : Number(row.psi_recommended).toFixed(1);
+            const psiStatus = get("psi_status", "—");
 
             tr.innerHTML = `
               <td>${ts}</td>
@@ -1322,6 +1351,9 @@ def index():
               <td>${sharpness}</td>
               <td>${edgeDensity}</td>
               <td>${continuity}</td>
+              <td>${psiMeasured}</td>
+              <td>${psiRec}</td>
+              <td><span class="verdict-badge ${verdictClass(psiStatus)}">${psiStatus}</span></td>
             `;
             tbody.appendChild(tr);
           });
@@ -1359,12 +1391,27 @@ def index():
         $("selTire").textContent = row.tire_position || "—";
         $("selOperator").textContent = row.operator || "—";
         $("selTimestamp").textContent = row.ts || "—";
-        $("selBrightness").textContent = (row.brightness || "").toFixed(2);
-        $("selSharpness").textContent = (row.sharpness || "").toFixed(2);
-        $("selEdgeDensity").textContent = (row.edge_density || "").toFixed(2);
-        $("selContinuity").textContent = (row.continuity || "").toFixed(2);
+        $("selBrightness").textContent = nfmt(row.brightness, 2);
+        $("selSharpness").textContent = nfmt(row.sharpness, 2);
+        $("selEdgeDensity").textContent = nfmt(row.edge_density, 2);
+        $("selContinuity").textContent = nfmt(row.continuity, 2);
+
+        const treadVerdict = row.tread_verdict || "—";
+        const psiMeasured = (typeof row.psi_measured === "number")
+          ? row.psi_measured.toFixed(1)
+          : (row.psi_measured ?? "—");
+        const psiRecommended = (typeof row.psi_recommended === "number")
+          ? row.psi_recommended.toFixed(1)
+          : (row.psi_recommended ?? "—");
+        const psiStatus = row.psi_status || "—";
+
+        $("selTreadVerdict").innerHTML = `<span class="verdict-badge ${verdictClass(treadVerdict)}">${treadVerdict}</span>`;
+        $("selPsiMeasured").textContent = psiMeasured;
+        $("selPsiRecommended").textContent = psiRecommended;
+        $("selPsiStatus").innerHTML = `<span class="verdict-badge ${verdictClass(psiStatus)}">${psiStatus}</span>`;
+
         $("selNotes").textContent = row.notes || row["notes"] || "—";
-        $("selMmPerPx").textContent = (row.mm_per_px || "").toFixed(6);
+        $("selMmPerPx").textContent = nfmt(row.mm_per_px, 6);
 
         $("details").textContent = JSON.stringify(row, null, 2);
 
@@ -1434,7 +1481,7 @@ def index():
         if (items.length === 0) {
           tbody.innerHTML = `
             <tr>
-              <td colspan="8" style="text-align: center; padding: 2rem; color: #6c757d;">
+              <td colspan="9" style="text-align: center; padding: 2rem; color: #6c757d;">
                 No validation results found
               </td>
             </tr>
@@ -1519,6 +1566,9 @@ def index():
         });
       });
     }
+
+    // Ensure every caller gets auto-fill behavior
+    loadScans = loadScansWithAutoFill;
 
     // ✅ Submit validation form
     $("btnSubmitVal").onclick = async () => {

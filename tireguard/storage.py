@@ -71,6 +71,11 @@ def init_db(cfg):
         ("operator", "TEXT"),
         ("session_notes", "TEXT"),
         ("mm_per_px", "REAL"),
+        # PSI + combined logic fields
+        ("tread_verdict", "TEXT"),
+        ("psi_measured", "REAL"),
+        ("psi_recommended", "REAL"),
+        ("psi_status", "TEXT"),
     ]
     for col, typ in migrations:
         if not _col_exists(cur, "results", col):
@@ -199,7 +204,8 @@ def list_results(cfg, limit=30, vehicle_id=None, tire_position=None, verdict=Non
     cur.execute(f"""
         SELECT 
             ts, verdict, score, vehicle_id, tire_position, operator,
-            brightness, sharpness, edge_density, continuity
+            brightness, sharpness, edge_density, continuity,
+            psi_measured, psi_recommended, psi_status, tread_verdict
         FROM results
         {where_sql}
         ORDER BY id DESC
@@ -219,6 +225,10 @@ def list_results(cfg, limit=30, vehicle_id=None, tire_position=None, verdict=Non
             "sharpness": r[7],
             "edge_density": r[8],
             "continuity": r[9],
+            "psi_measured": r[10],
+            "psi_recommended": r[11],
+            "psi_status": r[12],
+            "tread_verdict": r[13],
         }
         for r in rows
     ]
@@ -230,7 +240,8 @@ def get_result_by_ts(cfg, ts: str):
         SELECT ts,image_path,roi_x,roi_y,roi_w,roi_h,
                brightness,glare_ratio,sharpness,
                edge_density,continuity,score,verdict,notes,
-               vehicle_id,tire_position,operator,session_notes,mm_per_px
+               vehicle_id,tire_position,operator,session_notes,mm_per_px,
+               tread_verdict,psi_measured,psi_recommended,psi_status
         FROM results
         WHERE ts=?
         LIMIT 1
@@ -242,7 +253,8 @@ def get_result_by_ts(cfg, ts: str):
     keys = ["ts","image_path","roi_x","roi_y","roi_w","roi_h",
             "brightness","glare_ratio","sharpness",
             "edge_density","continuity","score","verdict","notes",
-            "vehicle_id","tire_position","operator","session_notes","mm_per_px"]
+            "vehicle_id","tire_position","operator","session_notes","mm_per_px",
+            "tread_verdict","psi_measured","psi_recommended","psi_status"]
     return dict(zip(keys, row))
 
 def find_processed_images(cfg, ts: str):
@@ -263,7 +275,8 @@ def export_csv(cfg):
     COLUMNS = [
         "ts","image_path","vehicle_id","tire_position","operator","session_notes",
         "brightness","glare_ratio","sharpness",
-        "edge_density","continuity","score","verdict",
+        "edge_density","continuity","score","verdict","tread_verdict",
+        "psi_measured","psi_recommended","psi_status",
         "mm_per_px","notes"
     ]
 
