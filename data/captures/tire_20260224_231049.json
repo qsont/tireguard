@@ -1,0 +1,39 @@
+{
+  "ts": "20260224_231049",
+  "camera_index": 0,
+  "roi": {
+    "x": 0,
+    "y": 0,
+    "w": 288,
+    "h": 216
+  },
+  "quality": {
+    "ok": false,
+    "reasons": [
+      "Too dark (brightness=25.6)",
+      "Too blurry (sharpness=2.1)"
+    ],
+    "metrics": {
+      "brightness": 25.62844007201646,
+      "glare_ratio": 0.0,
+      "sharpness": 2.107204240671264
+    }
+  },
+  "measure": {
+    "edge_density": 0.0,
+    "continuity": 0.0,
+    "score": 0.0
+  },
+  "verdict": "REPLACE",
+  "session": {
+    "vehicle_id": "Test",
+    "tire_position": "SPARE",
+    "operator": "charles krikr",
+    "notes": "test 10"
+  },
+  "calibration": {
+    "px_per_mm": 33.422896343674346,
+    "mm_per_px": 0.02991960929170823,
+    "method": "two_point"
+  }
+}
