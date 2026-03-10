@@ -187,8 +187,7 @@ class MainWindow(QMainWindow):
         self.psi_warn_delta = 3.0
 
         self.setWindowTitle("TireGuard - Simple 800x480")
-        self.resize(800, 480)
-        self.setMinimumSize(800, 480)
+        self.setFixedSize(800, 480)
 
         self._load_roi()
         self._build_ui()
@@ -400,9 +399,13 @@ class MainWindow(QMainWindow):
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
+            self.setFixedSize(800, 480)
             self.showNormal()
             self._set_status("Windowed mode")
         else:
+            # Release fixed-size lock so Qt can expand to fill the screen
+            self.setMinimumSize(0, 0)
+            self.setMaximumSize(16777215, 16777215)
             self.showFullScreen()
             self._set_status("Fullscreen mode")
         self._sync_fullscreen_button()
@@ -695,8 +698,11 @@ def run_app(cfg):
     w = MainWindow(cfg)
     screen = QApplication.primaryScreen()
     if screen and screen.geometry().width() <= 900 and screen.geometry().height() <= 540:
+        # Release fixed-size lock before going fullscreen
+        w.setMinimumSize(0, 0)
+        w.setMaximumSize(16777215, 16777215)
         w.showFullScreen()
     else:
-        w.show()
+        w.show()  # Fixed 800x480 locked in __init__
     w._sync_fullscreen_button()
     sys.exit(app.exec())
