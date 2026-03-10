@@ -27,8 +27,8 @@ install_autostart() {
 Type=Application
 Version=1.0
 Name=TireGuard
-Comment=Start TireGuard in compact touchscreen mode
-Exec=/bin/bash -lc 'cd "${ROOT_DIR}" && ./scripts/rpi_run.sh'
+Comment=Start TireGuard in dedicated 800x480 kiosk mode
+Exec=/bin/bash -lc 'cd "${ROOT_DIR}" && ./scripts/rpi_run_800x480.sh'
 Terminal=false
 X-GNOME-Autostart-enabled=true
 EOF

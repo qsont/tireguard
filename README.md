@@ -107,13 +107,16 @@ Two helper scripts are included under `scripts/` to speed up Pi deployment:
 
 ```bash
 # 1) Make scripts executable (first time only)
-chmod +x scripts/rpi_setup.sh scripts/rpi_run.sh
+chmod +x scripts/rpi_setup.sh scripts/rpi_run.sh scripts/rpi_run_800x480.sh
 
 # 2) Install system + Python dependencies
 ./scripts/rpi_setup.sh
 
 # 3) Run TireGuard in compact touchscreen mode (800x480 friendly)
 ./scripts/rpi_run.sh
+
+# 4) Run dedicated simple UI launcher for 800x480 screens
+./scripts/rpi_run_800x480.sh
 ```
 
 Manual launch presets:
@@ -139,6 +142,7 @@ Add kiosk-style autostart on Raspberry Pi Desktop login:
 
 ```bash
 # Install autostart entry (~/.config/autostart/tireguard.desktop)
+# Uses scripts/rpi_run_800x480.sh (dedicated 800x480 kiosk launcher)
 ./scripts/rpi_kiosk_autostart.sh install
 
 # Remove autostart entry later (optional)
