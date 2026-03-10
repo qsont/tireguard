@@ -245,8 +245,15 @@ class MainWindow(QMainWindow):
         title.setFont(QFont("Arial", 17, QFont.Bold))
         self.status = QLabel("Ready")
         self.status.setStyleSheet("color:#9fd9ff; font-weight:700; font-size:14px;")
+        self.btn_fullscreen = QPushButton("Fullscreen")
+        self.btn_fullscreen.setMinimumHeight(40)
+        self.btn_fullscreen.setStyleSheet(
+            "QPushButton { min-height: 40px; font-size: 14px; padding: 6px 10px; border-radius: 8px; }"
+        )
+        self.btn_fullscreen.clicked.connect(self._toggle_fullscreen)
         top.addWidget(title)
         top.addStretch(1)
+        top.addWidget(self.btn_fullscreen)
         top.addWidget(self.status)
         root.addLayout(top)
 
@@ -371,6 +378,7 @@ class MainWindow(QMainWindow):
         self._update_roi_info()
         self._update_psi_status_label()
         self._refresh_history()
+        self._sync_fullscreen_button()
 
     def _wrap_tab_scroll(self, page: QWidget) -> QScrollArea:
         scroll = QScrollArea()
@@ -381,6 +389,23 @@ class MainWindow(QMainWindow):
 
     def _set_status(self, text: str):
         self.status.setText(text)
+
+    def _sync_fullscreen_button(self):
+        if not hasattr(self, "btn_fullscreen"):
+            return
+        if self.isFullScreen():
+            self.btn_fullscreen.setText("Window")
+        else:
+            self.btn_fullscreen.setText("Fullscreen")
+
+    def _toggle_fullscreen(self):
+        if self.isFullScreen():
+            self.showNormal()
+            self._set_status("Windowed mode")
+        else:
+            self.showFullScreen()
+            self._set_status("Fullscreen mode")
+        self._sync_fullscreen_button()
 
     def _update_roi_info(self):
         if not self.roi:
@@ -673,4 +698,5 @@ def run_app(cfg):
         w.showFullScreen()
     else:
         w.show()
+    w._sync_fullscreen_button()
     sys.exit(app.exec())
