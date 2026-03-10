@@ -47,6 +47,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--web-only", action="store_true", help="Run web API only")
     parser.add_argument("--desktop-only", action="store_true", help="Run desktop UI only")
+    parser.add_argument("--simple-ui", action="store_true", help="Run simplified 800x480 touchscreen UI")
     parser.add_argument("--compact-ui", action="store_true", help="Force compact UI layout (recommended for 800x480 displays)")
     parser.add_argument("--rpi-ui", action="store_true", help="Raspberry Pi touchscreen preset (compact + fullscreen)")
     parser.add_argument("--no-browser", action="store_true", help="Do not auto-open dashboard")
@@ -70,6 +71,7 @@ if __name__ == "__main__":
         compact_override = True if (args.compact_ui or args.rpi_ui) else None
         run_app(
             cfg,
+            simple_ui=bool(args.simple_ui),
             compact_ui=compact_override,
             fullscreen=bool(args.rpi_ui),
             rpi_ui=bool(args.rpi_ui),
