@@ -107,7 +107,7 @@ Two helper scripts are included under `scripts/` to speed up Pi deployment:
 
 ```bash
 # 1) Make scripts executable (first time only)
-chmod +x scripts/rpi_setup.sh scripts/rpi_run.sh scripts/rpi_run_800x480.sh
+chmod +x scripts/rpi_setup.sh scripts/rpi_run.sh scripts/rpi_run_800x480.sh scripts/rpi_reset_data.sh
 
 # 2) Install system + Python dependencies
 ./scripts/rpi_setup.sh
@@ -117,6 +117,9 @@ chmod +x scripts/rpi_setup.sh scripts/rpi_run.sh scripts/rpi_run_800x480.sh
 
 # 4) Run dedicated simple UI launcher for 800x480 screens
 ./scripts/rpi_run_800x480.sh
+
+# 5) Optional: clear records/files for fresh dataset (keeps data/results.db)
+./scripts/rpi_reset_data.sh
 ```
 
 Manual launch presets:
@@ -253,6 +256,9 @@ TIREGUARD_HOST=0.0.0.0 TIREGUARD_PORT=9000 ./scripts/rpi_run_800x480.sh
 
 # Pass extra app args through script
 ./scripts/rpi_run_800x480.sh --desktop-only
+
+# Reset dataset (truncate DB rows + clear captures/processed exports, keep DB file)
+./scripts/rpi_reset_data.sh
 ```
 
 ```bash

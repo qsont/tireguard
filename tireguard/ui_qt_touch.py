@@ -8,12 +8,15 @@ from PySide6.QtGui import QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
+    QFormLayout,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QTabWidget,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -24,7 +27,16 @@ from .camera import open_camera
 from .preprocess import crop_roi, preprocess_bgr
 from .quality import run_quality_checks
 from .measure import groove_visibility_score, pass_fail_from_score
-from .storage import export_csv, init_db, insert_result, save_capture, save_processed
+from .storage import (
+    export_csv,
+    find_processed_images,
+    get_result_by_ts,
+    init_db,
+    insert_result,
+    list_results,
+    save_capture,
+    save_processed,
+)
 
 
 def bgr_to_qimage(frame_bgr):
@@ -234,14 +246,14 @@ class MainWindow(QMainWindow):
         self.video.on_roi_selected = self._on_roi_selected
         root.addWidget(self.video, 3)
 
-        meta = QHBoxLayout()
-        self.in_vehicle = QLineEdit()
-        self.in_vehicle.setPlaceholderText("Vehicle ID")
-        self.in_tire = QComboBox()
-        self.in_tire.addItems(["FL", "FR", "RL", "RR", "SPARE"])
-        meta.addWidget(self.in_vehicle, 2)
-        meta.addWidget(self.in_tire, 1)
-        root.addLayout(meta)
+        tabs = QTabWidget()
+        tabs.setStyleSheet("QTabBar::tab { min-height: 32px; min-width: 110px; font-size: 15px; font-weight: 700; }")
+        root.addWidget(tabs, 2)
+
+        tab_scan = QWidget()
+        scan_layout = QVBoxLayout(tab_scan)
+        scan_layout.setContentsMargins(4, 4, 4, 4)
+        scan_layout.setSpacing(6)
 
         buttons1 = QHBoxLayout()
         self.btn_roi = QPushButton("Set ROI")
@@ -250,20 +262,70 @@ class MainWindow(QMainWindow):
         buttons1.addWidget(self.btn_roi)
         buttons1.addWidget(self.btn_auto_roi)
         buttons1.addWidget(self.btn_clear_roi)
-        root.addLayout(buttons1)
+        scan_layout.addLayout(buttons1)
 
         buttons2 = QHBoxLayout()
         self.btn_capture = QPushButton("Capture + Analyze")
         self.btn_export = QPushButton("Export CSV")
         buttons2.addWidget(self.btn_capture, 2)
         buttons2.addWidget(self.btn_export, 1)
-        root.addLayout(buttons2)
+        scan_layout.addLayout(buttons2)
 
         self.result = QTextEdit()
         self.result.setReadOnly(True)
-        self.result.setMinimumHeight(84)
-        self.result.setMaximumHeight(110)
-        root.addWidget(self.result, 1)
+        self.result.setMinimumHeight(88)
+        self.result.setMaximumHeight(120)
+        scan_layout.addWidget(self.result)
+
+        tab_session = QWidget()
+        sess_form = QFormLayout(tab_session)
+        sess_form.setContentsMargins(8, 8, 8, 8)
+        sess_form.setSpacing(6)
+        self.in_vehicle = QLineEdit()
+        self.in_vehicle.setPlaceholderText("Vehicle ID")
+        self.in_tire = QComboBox()
+        self.in_tire.addItems(["FL", "FR", "RL", "RR", "SPARE"])
+        self.in_operator = QLineEdit()
+        self.in_operator.setPlaceholderText("Operator")
+        self.in_notes = QLineEdit()
+        self.in_notes.setPlaceholderText("Notes")
+        sess_form.addRow("Vehicle", self.in_vehicle)
+        sess_form.addRow("Tire", self.in_tire)
+        sess_form.addRow("Operator", self.in_operator)
+        sess_form.addRow("Notes", self.in_notes)
+
+        tab_history = QWidget()
+        history_layout = QVBoxLayout(tab_history)
+        history_layout.setContentsMargins(6, 6, 6, 6)
+        history_layout.setSpacing(6)
+        self.history = QListWidget()
+        self.history.setMinimumHeight(120)
+        self.history.itemSelectionChanged.connect(self._on_history_select)
+        history_layout.addWidget(self.history)
+        btn_hist_refresh = QPushButton("Refresh History")
+        btn_hist_refresh.clicked.connect(self._refresh_history)
+        history_layout.addWidget(btn_hist_refresh)
+
+        tab_settings = QWidget()
+        set_layout = QFormLayout(tab_settings)
+        set_layout.setContentsMargins(8, 8, 8, 8)
+        set_layout.setSpacing(6)
+        self.cam_idx = QComboBox()
+        self.cam_idx.addItems([str(i) for i in range(0, 6)])
+        self.cam_idx.setCurrentText("0")
+        self.res_combo = QComboBox()
+        self.res_combo.addItems(["640x480", "1280x720", "1920x1080"])
+        self.res_combo.setCurrentText(f"{self.cfg.width}x{self.cfg.height}")
+        self.btn_open_cam = QPushButton("Open Camera")
+        self.btn_open_cam.clicked.connect(self._reopen_camera)
+        set_layout.addRow("Camera", self.cam_idx)
+        set_layout.addRow("Resolution", self.res_combo)
+        set_layout.addRow(self.btn_open_cam)
+
+        tabs.addTab(tab_scan, "Scan")
+        tabs.addTab(tab_session, "Session")
+        tabs.addTab(tab_history, "History")
+        tabs.addTab(tab_settings, "Settings")
 
         self.btn_roi.clicked.connect(self._toggle_roi_mode)
         self.btn_auto_roi.clicked.connect(self._auto_roi)
@@ -271,6 +333,7 @@ class MainWindow(QMainWindow):
         self.btn_capture.clicked.connect(self._capture_analyze)
         self.btn_export.clicked.connect(self._export_csv)
         self._update_roi_info()
+        self._refresh_history()
 
     def _set_status(self, text: str):
         self.status.setText(text)
@@ -299,11 +362,33 @@ class MainWindow(QMainWindow):
 
     def _open_camera(self):
         try:
-            self.cap, self.cam_index = open_camera(self.cfg.cam_index, self.cfg.width, self.cfg.height, self.cfg.fps)
+            preferred = self.cfg.cam_index
+            if hasattr(self, "cam_idx"):
+                try:
+                    preferred = int(self.cam_idx.currentText())
+                except Exception:
+                    preferred = self.cfg.cam_index
+            self.cap, self.cam_index = open_camera(preferred, self.cfg.width, self.cfg.height, self.cfg.fps)
+            if hasattr(self, "cam_idx"):
+                self.cam_idx.setCurrentText(str(self.cam_index))
             self._set_status(f"Camera {self.cam_index} connected")
         except Exception as exc:
             QMessageBox.critical(self, "Camera Error", str(exc))
             self.close()
+
+    def _reopen_camera(self):
+        label = self.res_combo.currentText() if hasattr(self, "res_combo") else ""
+        if "x" in label:
+            try:
+                w, h = label.split("x", 1)
+                self.cfg.width = int(w)
+                self.cfg.height = int(h)
+            except Exception:
+                pass
+        if self.cap is not None:
+            self.cap.release()
+            self.cap = None
+        self._open_camera()
 
     def _tick(self):
         if self.cap is None:
@@ -377,6 +462,8 @@ class MainWindow(QMainWindow):
             "session": {
                 "vehicle_id": self.in_vehicle.text().strip() or None,
                 "tire_position": self.in_tire.currentText(),
+                "operator": self.in_operator.text().strip() or None,
+                "session_notes": self.in_notes.text().strip() or None,
             },
         }
 
@@ -402,6 +489,8 @@ class MainWindow(QMainWindow):
                 "notes": "; ".join(q["reasons"]) if not q["ok"] else "",
                 "vehicle_id": self.in_vehicle.text().strip() or None,
                 "tire_position": self.in_tire.currentText(),
+                "operator": self.in_operator.text().strip() or None,
+                "session_notes": self.in_notes.text().strip() or None,
             },
         )
 
@@ -409,17 +498,46 @@ class MainWindow(QMainWindow):
             f"TS: {ts}\n"
             f"Vehicle: {self.in_vehicle.text().strip() or '-'}\n"
             f"Tire: {self.in_tire.currentText()}\n"
+            f"Operator: {self.in_operator.text().strip() or '-'}\n"
             f"Score: {float(m['score']):.4f}\n"
             f"Verdict: {verdict}\n"
             f"Brightness: {float(q['metrics']['brightness']):.2f}\n"
             f"Sharpness: {float(q['metrics']['sharpness']):.2f}\n"
         )
         self._set_status(f"Captured: {verdict}")
+        self._refresh_history()
 
     def _export_csv(self):
         out = export_csv(self.cfg)
         self._set_status(f"CSV exported: {out}")
         QMessageBox.information(self, "Export CSV", f"Exported: {out}")
+
+    def _refresh_history(self):
+        if not hasattr(self, "history"):
+            return
+        self.history.clear()
+        for row in list_results(self.cfg, limit=30):
+            score = float(row.get("score", 0.0)) if row.get("score") is not None else 0.0
+            self.history.addItem(f"{row['ts']} | {row['verdict']} | {score:.4f}")
+
+    def _on_history_select(self):
+        if not hasattr(self, "history") or not self.history.selectedItems():
+            return
+        line = self.history.selectedItems()[0].text()
+        ts = line.split("|")[0].strip()
+        row = get_result_by_ts(self.cfg, ts)
+        if not row:
+            return
+        imgs = find_processed_images(self.cfg, ts)
+        self.result.setPlainText(
+            f"TS: {row['ts']}\n"
+            f"Vehicle: {row.get('vehicle_id') or '-'}\n"
+            f"Tire: {row.get('tire_position') or '-'}\n"
+            f"Operator: {row.get('operator') or '-'}\n"
+            f"Score: {float(row.get('score') or 0.0):.4f}\n"
+            f"Verdict: {row.get('verdict') or '-'}\n"
+            f"Processed files: {', '.join(sorted(imgs.keys())) if imgs else 'none'}\n"
+        )
 
     def closeEvent(self, event):
         if self.cap is not None:
