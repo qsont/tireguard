@@ -48,6 +48,7 @@ if __name__ == "__main__":
     parser.add_argument("--web-only", action="store_true", help="Run web API only")
     parser.add_argument("--desktop-only", action="store_true", help="Run desktop UI only")
     parser.add_argument("--compact-ui", action="store_true", help="Force compact UI layout (recommended for 800x480 displays)")
+    parser.add_argument("--rpi-ui", action="store_true", help="Raspberry Pi touchscreen preset (compact + fullscreen)")
     parser.add_argument("--no-browser", action="store_true", help="Do not auto-open dashboard")
     parser.add_argument("--host", default="0.0.0.0", help="Web host bind address")
     parser.add_argument("--port", type=int, default=8000, help="Web port")
@@ -66,6 +67,12 @@ if __name__ == "__main__":
 
     try:
         cfg = AppConfig()
-        run_app(cfg, compact_ui=True if args.compact_ui else None)
+        compact_override = True if (args.compact_ui or args.rpi_ui) else None
+        run_app(
+            cfg,
+            compact_ui=compact_override,
+            fullscreen=bool(args.rpi_ui),
+            rpi_ui=bool(args.rpi_ui),
+        )
     finally:
         _stop_process(web_proc)

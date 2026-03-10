@@ -18,5 +18,5 @@ source "${VENV_DIR}/bin/activate"
 
 cd "${ROOT_DIR}"
 
-# Default run mode for Raspberry Pi touchscreen: compact UI + no browser auto-open.
-exec python app.py --compact-ui --no-browser --host "${HOST}" --port "${PORT}" "$@"
+# Default run mode for Raspberry Pi touchscreen: dedicated Pi UI preset + no browser auto-open.
+exec python app.py --rpi-ui --no-browser --host "${HOST}" --port "${PORT}" "$@"

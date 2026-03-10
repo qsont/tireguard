@@ -302,13 +302,16 @@ class VideoWidget(QLabel):
 class MainWindow(QMainWindow):
     """TireGuard main UI with 4-step wizard workflow."""
     
-    def __init__(self, cfg, compact_ui: Optional[bool] = None):
+    def __init__(self, cfg, compact_ui: Optional[bool] = None, rpi_ui: bool = False):
         super().__init__()
         self.cfg = cfg
+        self.rpi_ui = bool(rpi_ui)
         init_db(cfg)
         self.setWindowTitle(APP_NAME)
         self.screen_size = self._primary_screen_size()
-        if compact_ui is None:
+        if self.rpi_ui:
+            self.compact_ui = True
+        elif compact_ui is None:
             self.compact_ui = self._is_compact_screen(self.screen_size)
         else:
             self.compact_ui = bool(compact_ui)
@@ -359,7 +362,7 @@ class MainWindow(QMainWindow):
 
     def _apply_theme(self):
         """Apply dark theme with cyan accents."""
-        self.setStyleSheet("""
+        base = """
             QMainWindow {
                 background: #070a10;
             }
@@ -474,7 +477,42 @@ class MainWindow(QMainWindow):
             QComboBox::down-arrow {
                 image: none;
             }
-        """)
+        """
+        compact_overrides = """
+            QLabel {
+                font-size: 12px;
+            }
+            QPushButton {
+                padding: 8px;
+                border-radius: 12px;
+                min-height: 34px;
+                font-size: 12px;
+            }
+            QLineEdit, QComboBox, QTextEdit {
+                padding: 6px;
+                border-radius: 10px;
+                min-height: 30px;
+                font-size: 12px;
+            }
+            QGroupBox {
+                margin-top: 8px;
+                padding: 8px;
+            }
+            QListWidget::item {
+                padding: 6px 10px;
+            }
+        """
+        self.setStyleSheet(base + (compact_overrides if self.compact_ui else ""))
+
+    def _wrap_step_for_compact(self, page: QWidget) -> QWidget:
+        if not self.compact_ui:
+            return page
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setWidget(page)
+        return scroll
 
     # ---------- UI Building ----------
     def _build_ui(self):
@@ -483,15 +521,21 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
         
         main_layout = QVBoxLayout(central)
-        main_layout.setContentsMargins(10, 10, 10, 10)
-        main_layout.setSpacing(10)
+        if self.compact_ui:
+            main_layout.setContentsMargins(6, 6, 6, 6)
+            main_layout.setSpacing(6)
+        else:
+            main_layout.setContentsMargins(10, 10, 10, 10)
+            main_layout.setSpacing(10)
         
         # Top bar
         top = QHBoxLayout()
         title = QLabel("TireGuard")
-        title.setFont(QFont("Arial", 18, QFont.Bold))
+        title.setFont(QFont("Arial", 14 if self.compact_ui else 18, QFont.Bold))
         subtitle = QLabel("Tread visibility & capture workflow")
         subtitle.setStyleSheet("color: rgba(232,247,255,0.65);")
+        if self.compact_ui:
+            subtitle.hide()
         title_box = QVBoxLayout()
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
@@ -506,16 +550,19 @@ class MainWindow(QMainWindow):
         self.video.setParent(self)
         if self.compact_ui:
             self.video.setMinimumSize(320, 200)
-            self.video.setMaximumHeight(260)
+            self.video.setMaximumHeight(220)
         self.steps = QStackedWidget()
         
-        self.steps.addWidget(self._step_camera())
-        self.steps.addWidget(self._step_roi())
-        self.steps.addWidget(self._step_calibrate())
-        self.steps.addWidget(self._step_scan())
+        self.steps.addWidget(self._wrap_step_for_compact(self._step_camera()))
+        self.steps.addWidget(self._wrap_step_for_compact(self._step_roi()))
+        self.steps.addWidget(self._wrap_step_for_compact(self._step_calibrate()))
+        self.steps.addWidget(self._wrap_step_for_compact(self._step_scan()))
         
         self.btn_back = QPushButton("← Back")
         self.btn_next = QPushButton("Next →")
+        if self.compact_ui:
+            self.btn_back.setMinimumHeight(34)
+            self.btn_next.setMinimumHeight(34)
         self.btn_back.clicked.connect(self.prev_step)
         self.btn_next.clicked.connect(self.next_step)
         
@@ -526,7 +573,7 @@ class MainWindow(QMainWindow):
         right_content = QWidget()
         right_layout = QVBoxLayout(right_content)
         right_layout.setContentsMargins(0, 0, 0, 0)
-        right_layout.setSpacing(10)
+        right_layout.setSpacing(6 if self.compact_ui else 10)
         right_layout.addWidget(self.steps)
         right_layout.addLayout(nav)
         
@@ -541,9 +588,9 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self.video)
         splitter.addWidget(right_content)
         splitter.setChildrenCollapsible(False)
-        splitter.setHandleWidth(8)
+        splitter.setHandleWidth(6 if self.compact_ui else 8)
         if self.compact_ui:
-            splitter.setSizes([220, 240])
+            splitter.setSizes([190, 290])
             splitter.setStretchFactor(0, 1)
             splitter.setStretchFactor(1, 2)
         else:
@@ -562,6 +609,8 @@ class MainWindow(QMainWindow):
         act_adv = QAction("Toggle Advanced", self)
         act_adv.triggered.connect(self.toggle_advanced)
         self.menuBar().addAction(act_adv)
+        if self.compact_ui:
+            self.menuBar().setNativeMenuBar(False)
         self._update_nav_buttons()
 
     def _card(self, title_text: str, body_widget: QWidget) -> QWidget:
@@ -1585,9 +1634,17 @@ class MainWindow(QMainWindow):
         if vis:
             self._refresh_history()
 
-def run_app(cfg, compact_ui: Optional[bool] = None):
+def run_app(
+    cfg,
+    compact_ui: Optional[bool] = None,
+    fullscreen: bool = False,
+    rpi_ui: bool = False,
+):
     """Launch the TireGuard application."""
     app = QApplication(sys.argv)
-    w = MainWindow(cfg, compact_ui=compact_ui)
-    w.show()
+    w = MainWindow(cfg, compact_ui=compact_ui, rpi_ui=rpi_ui)
+    if fullscreen or rpi_ui:
+        w.showFullScreen()
+    else:
+        w.show()
     sys.exit(app.exec())

@@ -116,6 +116,16 @@ chmod +x scripts/rpi_setup.sh scripts/rpi_run.sh
 ./scripts/rpi_run.sh
 ```
 
+Manual launch presets:
+
+```bash
+# Dedicated Raspberry Pi UI profile (compact + fullscreen)
+python app.py --rpi-ui --no-browser --host 0.0.0.0 --port 8000
+
+# Compact mode only (windowed)
+python app.py --compact-ui
+```
+
 Optional environment overrides:
 
 ```bash
@@ -130,6 +140,16 @@ Add kiosk-style autostart on Raspberry Pi Desktop login:
 
 # Remove autostart entry later (optional)
 ./scripts/rpi_kiosk_autostart.sh remove
+```
+
+Create a clickable desktop launcher icon (single-click run):
+
+```bash
+# Create ~/Desktop/TireGuard.desktop
+./scripts/rpi_desktop_launcher.sh install
+
+# Remove launcher later (optional)
+./scripts/rpi_desktop_launcher.sh remove
 ```
 
 ### E. Update Raspberry Pi App Over SSH (from Arch Linux PC)

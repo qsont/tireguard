@@ -1,0 +1,42 @@
+{
+  "ts": "20260310_194414",
+  "camera_index": 0,
+  "roi": {
+    "x": 320,
+    "y": 96,
+    "w": 288,
+    "h": 216
+  },
+  "quality": {
+    "ok": true,
+    "reasons": [],
+    "metrics": {
+      "brightness": 65.81372170781893,
+      "glare_ratio": 0.00016075102880658436,
+      "sharpness": 401.3219539587616
+    }
+  },
+  "measure": {
+    "edge_density": 0.1861496913580247,
+    "continuity": 1157.2,
+    "score": 0.24026297475259373
+  },
+  "verdict": "REPLACE",
+  "tread_verdict": "GOOD",
+  "psi": {
+    "measured": 22.0,
+    "recommended": 32.0,
+    "status": "REPLACE"
+  },
+  "session": {
+    "vehicle_id": "TEST 1 (new updated rpi)",
+    "tire_position": "FL",
+    "operator": "Charles Melchor",
+    "notes": "testing if possible on the rpi"
+  },
+  "calibration": {
+    "px_per_mm": 27.364941074301623,
+    "mm_per_px": 0.036543108106273196,
+    "method": "two_point"
+  }
+}
