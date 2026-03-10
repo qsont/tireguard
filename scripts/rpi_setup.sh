@@ -31,8 +31,7 @@ if [[ -n "${APT_INSTALL_CMD}" ]]; then
     python3-pip \
     python3-dev \
     libgl1 \
-    libglib2.0-0 \
-    libatlas-base-dev
+    libglib2.0-0
 else
   echo "[1/4] Skipping apt packages (apt-get not available on this system)."
 fi
@@ -51,4 +50,4 @@ python -m pip install -r "${ROOT_DIR}/requirements.txt"
 
 echo ""
 echo "Setup complete."
-echo "Run the app with: ./scripts/rpi_run.sh"
+echo "Run the 800x480 app with: ./scripts/rpi_run_800x480.sh"

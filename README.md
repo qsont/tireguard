@@ -153,6 +153,7 @@ Create a clickable desktop launcher icon (single-click run):
 
 ```bash
 # Create ~/Desktop/TireGuard.desktop
+# Uses scripts/rpi_run_800x480.sh
 ./scripts/rpi_desktop_launcher.sh install
 
 # Remove launcher later (optional)
@@ -212,7 +213,7 @@ python -m pip install -r requirements.txt
 Raspberry Pi quick setup (automated):
 
 ```bash
-chmod +x scripts/rpi_setup.sh scripts/rpi_run.sh
+chmod +x scripts/rpi_setup.sh scripts/rpi_run.sh scripts/rpi_run_800x480.sh
 ./scripts/rpi_setup.sh
 ```
 
@@ -241,15 +242,17 @@ python app.py --web-only --host 0.0.0.0 --port 8000
 #### 3) Raspberry Pi helper scripts
 
 ```bash
-# Run with script defaults (rpi-ui + no-browser)
+# Preferred dedicated launcher for 800x480
+./scripts/rpi_run_800x480.sh
+
+# Backward-compatible alias (delegates to rpi_run_800x480.sh)
 ./scripts/rpi_run.sh
 
 # Override host/port
-TIREGUARD_HOST=0.0.0.0 TIREGUARD_PORT=9000 ./scripts/rpi_run.sh
+TIREGUARD_HOST=0.0.0.0 TIREGUARD_PORT=9000 ./scripts/rpi_run_800x480.sh
 
 # Pass extra app args through script
-./scripts/rpi_run.sh --desktop-only
-./scripts/rpi_run.sh --simple-ui
+./scripts/rpi_run_800x480.sh --desktop-only
 ```
 
 ```bash

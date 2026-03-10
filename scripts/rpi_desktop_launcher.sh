@@ -27,8 +27,8 @@ install_launcher() {
 Type=Application
 Version=1.0
 Name=TireGuard
-Comment=Launch TireGuard scanner app
-Exec=/bin/bash -lc 'cd "${ROOT_DIR}" && ./scripts/rpi_run.sh'
+Comment=Launch TireGuard scanner app (800x480 mode)
+Exec=/bin/bash -lc 'cd "${ROOT_DIR}" && ./scripts/rpi_run_800x480.sh'
 Path=${ROOT_DIR}
 Terminal=false
 Categories=Utility;
