@@ -101,6 +101,56 @@ pip install -r requirements.txt
 python app.py --host 0.0.0.0 --port 8000
 ```
 
+### D. Quick Raspberry Pi Scripts
+
+Two helper scripts are included under `scripts/` to speed up Pi deployment:
+
+```bash
+# 1) Make scripts executable (first time only)
+chmod +x scripts/rpi_setup.sh scripts/rpi_run.sh
+
+# 2) Install system + Python dependencies
+./scripts/rpi_setup.sh
+
+# 3) Run TireGuard in compact touchscreen mode (800x480 friendly)
+./scripts/rpi_run.sh
+```
+
+Optional environment overrides:
+
+```bash
+TIREGUARD_HOST=0.0.0.0 TIREGUARD_PORT=8000 ./scripts/rpi_run.sh
+```
+
+Add kiosk-style autostart on Raspberry Pi Desktop login:
+
+```bash
+# Install autostart entry (~/.config/autostart/tireguard.desktop)
+./scripts/rpi_kiosk_autostart.sh install
+
+# Remove autostart entry later (optional)
+./scripts/rpi_kiosk_autostart.sh remove
+```
+
+### E. Update Raspberry Pi App Over SSH (from Arch Linux PC)
+
+After pushing updates to GitHub, update the Pi remotely:
+
+```bash
+# Example host/user: pi@192.168.1.50
+ssh pi@<pi-ip-address> '
+    cd ~/tireguard-app &&
+    git pull origin development &&
+    ./scripts/rpi_setup.sh
+'
+```
+
+If autostart is enabled, reboot to load the updated app at startup:
+
+```bash
+ssh pi@<pi-ip-address> 'sudo reboot'
+```
+
 > 💡 **Access web dashboard** (data viewer/export only):  
 > `http://<pi-ip-address>:8000` from any device on same LAN  
 > *(Note: Web interface is supplementary—core scanning happens via touchscreen app)*

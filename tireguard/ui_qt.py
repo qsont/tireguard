@@ -302,12 +302,22 @@ class VideoWidget(QLabel):
 class MainWindow(QMainWindow):
     """TireGuard main UI with 4-step wizard workflow."""
     
-    def __init__(self, cfg):
+    def __init__(self, cfg, compact_ui: Optional[bool] = None):
         super().__init__()
         self.cfg = cfg
         init_db(cfg)
         self.setWindowTitle(APP_NAME)
-        self.resize(1360, 800)
+        self.screen_size = self._primary_screen_size()
+        if compact_ui is None:
+            self.compact_ui = self._is_compact_screen(self.screen_size)
+        else:
+            self.compact_ui = bool(compact_ui)
+        if self.compact_ui:
+            self.resize(max(760, self.screen_size.width()), max(440, self.screen_size.height()))
+            self.setMinimumSize(760, 440)
+        else:
+            self.resize(1360, 800)
+            self.setMinimumSize(1080, 700)
         
         # Core state
         self.cap = None
@@ -337,6 +347,15 @@ class MainWindow(QMainWindow):
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._tick)
         self.timer.start(15)
+
+    def _primary_screen_size(self) -> QSize:
+        screen = QApplication.primaryScreen()
+        if screen is not None:
+            return screen.availableGeometry().size()
+        return QSize(1360, 800)
+
+    def _is_compact_screen(self, size: QSize) -> bool:
+        return size.width() <= 900 or size.height() <= 540
 
     def _apply_theme(self):
         """Apply dark theme with cyan accents."""
@@ -485,6 +504,9 @@ class MainWindow(QMainWindow):
         # Main content: split video + wizard
         self.video = VideoWidget()
         self.video.setParent(self)
+        if self.compact_ui:
+            self.video.setMinimumSize(320, 200)
+            self.video.setMaximumHeight(260)
         self.steps = QStackedWidget()
         
         self.steps.addWidget(self._step_camera())
@@ -510,15 +532,24 @@ class MainWindow(QMainWindow):
         
         right_content.setMinimumWidth(420)
         right_content.setMaximumWidth(600)
+        if self.compact_ui:
+            right_content.setMinimumWidth(300)
+            right_content.setMaximumWidth(16777215)
         
-        splitter = QSplitter(Qt.Horizontal)
+        splitter_orientation = Qt.Vertical if self.compact_ui else Qt.Horizontal
+        splitter = QSplitter(splitter_orientation)
         splitter.addWidget(self.video)
         splitter.addWidget(right_content)
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(8)
-        splitter.setSizes([800, 400])
-        splitter.setStretchFactor(0, 3)
-        splitter.setStretchFactor(1, 1)
+        if self.compact_ui:
+            splitter.setSizes([220, 240])
+            splitter.setStretchFactor(0, 1)
+            splitter.setStretchFactor(1, 2)
+        else:
+            splitter.setSizes([800, 400])
+            splitter.setStretchFactor(0, 3)
+            splitter.setStretchFactor(1, 1)
         
         self.video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         right_content.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
@@ -1554,9 +1585,9 @@ class MainWindow(QMainWindow):
         if vis:
             self._refresh_history()
 
-def run_app(cfg):
+def run_app(cfg, compact_ui: Optional[bool] = None):
     """Launch the TireGuard application."""
     app = QApplication(sys.argv)
-    w = MainWindow(cfg)
+    w = MainWindow(cfg, compact_ui=compact_ui)
     w.show()
     sys.exit(app.exec())
