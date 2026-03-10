@@ -12,3 +12,9 @@ dist/
 # python cache
 __pycache__/
 *.pyc
+
+# runtime scan artifacts (keep directory structure only)
+data/captures/*
+!data/captures/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
