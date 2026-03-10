@@ -4,7 +4,7 @@ from typing import Dict, Optional, Tuple
 
 import cv2
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFont, QImage, QPainter, QPen, QPixmap
+from PySide6.QtGui import QDoubleValidator, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QTabWidget,
     QTextEdit,
     QVBoxLayout,
@@ -181,6 +182,9 @@ class MainWindow(QMainWindow):
         self.cap = None
         self.cam_index = None
         self.roi: Optional[Dict[str, int]] = None
+        self.psi_default_recommended = 32.0
+        self.psi_good_delta = 1.5
+        self.psi_warn_delta = 3.0
 
         self.setWindowTitle("TireGuard - Simple 800x480")
         self.resize(800, 480)
@@ -218,6 +222,14 @@ class MainWindow(QMainWindow):
                 min-height: 40px;
                 font-size: 17px;
                 padding: 6px;
+            }
+            QScrollArea {
+                border: 1px solid #1b2f45;
+                border-radius: 8px;
+                background: #07101b;
+            }
+            QScrollBar:vertical {
+                width: 10px;
             }
             """
         )
@@ -289,10 +301,21 @@ class MainWindow(QMainWindow):
         self.in_operator.setPlaceholderText("Operator")
         self.in_notes = QLineEdit()
         self.in_notes.setPlaceholderText("Notes")
+        self.in_psi_measured = QLineEdit()
+        self.in_psi_measured.setPlaceholderText("Measured PSI (e.g., 31.5)")
+        self.in_psi_recommended = QLineEdit()
+        self.in_psi_recommended.setPlaceholderText("Recommended PSI (e.g., 32.0)")
+        self.psi_status = QLabel("PSI Status: -")
+        self.psi_status.setStyleSheet("color:#9fd9ff; font-size:14px; font-weight:700;")
         sess_form.addRow("Vehicle", self.in_vehicle)
         sess_form.addRow("Tire", self.in_tire)
         sess_form.addRow("Operator", self.in_operator)
+        sess_form.addRow("PSI Measured", self.in_psi_measured)
+        sess_form.addRow("PSI Recommended", self.in_psi_recommended)
+        sess_form.addRow("PSI Status", self.psi_status)
         sess_form.addRow("Notes", self.in_notes)
+        self.in_psi_measured.textChanged.connect(self._update_psi_status_label)
+        self.in_psi_recommended.textChanged.connect(self._update_psi_status_label)
 
         tab_history = QWidget()
         history_layout = QVBoxLayout(tab_history)
@@ -318,22 +341,43 @@ class MainWindow(QMainWindow):
         self.res_combo.setCurrentText(f"{self.cfg.width}x{self.cfg.height}")
         self.btn_open_cam = QPushButton("Open Camera")
         self.btn_open_cam.clicked.connect(self._reopen_camera)
+        psi_validator = QDoubleValidator(0.0, 120.0, 1)
+        self.psi_default_input = QLineEdit(f"{self.psi_default_recommended:.1f}")
+        self.psi_default_input.setValidator(psi_validator)
+        self.psi_good_input = QLineEdit(f"{self.psi_good_delta:.1f}")
+        self.psi_good_input.setValidator(psi_validator)
+        self.psi_warn_input = QLineEdit(f"{self.psi_warn_delta:.1f}")
+        self.psi_warn_input.setValidator(psi_validator)
         set_layout.addRow("Camera", self.cam_idx)
         set_layout.addRow("Resolution", self.res_combo)
+        set_layout.addRow("Default PSI", self.psi_default_input)
+        set_layout.addRow("Good ±", self.psi_good_input)
+        set_layout.addRow("Warn ±", self.psi_warn_input)
         set_layout.addRow(self.btn_open_cam)
 
-        tabs.addTab(tab_scan, "Scan")
-        tabs.addTab(tab_session, "Session")
-        tabs.addTab(tab_history, "History")
-        tabs.addTab(tab_settings, "Settings")
+        tabs.addTab(self._wrap_tab_scroll(tab_scan), "Scan")
+        tabs.addTab(self._wrap_tab_scroll(tab_session), "Session")
+        tabs.addTab(self._wrap_tab_scroll(tab_history), "History")
+        tabs.addTab(self._wrap_tab_scroll(tab_settings), "Settings")
 
         self.btn_roi.clicked.connect(self._toggle_roi_mode)
         self.btn_auto_roi.clicked.connect(self._auto_roi)
         self.btn_clear_roi.clicked.connect(self._clear_roi)
         self.btn_capture.clicked.connect(self._capture_analyze)
         self.btn_export.clicked.connect(self._export_csv)
+        self.psi_default_input.textChanged.connect(self._update_psi_status_label)
+        self.psi_good_input.textChanged.connect(self._update_psi_status_label)
+        self.psi_warn_input.textChanged.connect(self._update_psi_status_label)
         self._update_roi_info()
+        self._update_psi_status_label()
         self._refresh_history()
+
+    def _wrap_tab_scroll(self, page: QWidget) -> QScrollArea:
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setWidget(page)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        return scroll
 
     def _set_status(self, text: str):
         self.status.setText(text)
@@ -375,6 +419,49 @@ class MainWindow(QMainWindow):
         except Exception as exc:
             QMessageBox.critical(self, "Camera Error", str(exc))
             self.close()
+
+    def _to_float_or_none(self, text: str) -> Optional[float]:
+        try:
+            v = text.strip()
+            return float(v) if v != "" else None
+        except Exception:
+            return None
+
+    def _psi_verdict(self, measured: Optional[float], recommended: Optional[float]) -> str:
+        if measured is None:
+            return "NO_DATA"
+        good_delta, warn_delta, target_default = self._get_psi_settings()
+        target = target_default if recommended is None else float(recommended)
+        delta = abs(float(measured) - target)
+        is_low = float(measured) < target
+        direction = "LOW" if is_low else "HIGH"
+        if delta <= good_delta:
+            return "GOOD"
+        if delta <= warn_delta:
+            return f"WARN {direction}"
+        return f"CRITICAL {direction}"
+
+    def _get_psi_settings(self) -> Tuple[float, float, float]:
+        good = self._to_float_or_none(self.psi_good_input.text()) if hasattr(self, "psi_good_input") else None
+        warn = self._to_float_or_none(self.psi_warn_input.text()) if hasattr(self, "psi_warn_input") else None
+        default_rec = self._to_float_or_none(self.psi_default_input.text()) if hasattr(self, "psi_default_input") else None
+
+        good = self.psi_good_delta if good is None else max(0.1, good)
+        warn = self.psi_warn_delta if warn is None else max(good + 0.1, warn)
+        default_rec = self.psi_default_recommended if default_rec is None else max(0.0, default_rec)
+        return good, warn, default_rec
+
+    def _update_psi_status_label(self):
+        measured = self._to_float_or_none(self.in_psi_measured.text()) if hasattr(self, "in_psi_measured") else None
+        recommended = self._to_float_or_none(self.in_psi_recommended.text()) if hasattr(self, "in_psi_recommended") else None
+        good_delta, warn_delta, default_rec = self._get_psi_settings()
+        status = self._psi_verdict(measured, recommended)
+        rec_text = recommended if recommended is not None else default_rec
+        text = status if status != "NO_DATA" else f"- (target {rec_text:.1f})"
+        if hasattr(self, "psi_status"):
+            self.psi_status.setText(
+                f"PSI Status: {text} | good ±{good_delta:.1f}, warn ±{warn_delta:.1f}"
+            )
 
     def _reopen_camera(self):
         label = self.res_combo.currentText() if hasattr(self, "res_combo") else ""
@@ -440,6 +527,18 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "ROI Required", "Set ROI first.")
             return
 
+        vehicle = self.in_vehicle.text().strip()
+        operator = self.in_operator.text().strip()
+        psi_measured = self._to_float_or_none(self.in_psi_measured.text())
+        psi_recommended = self._to_float_or_none(self.in_psi_recommended.text())
+        if not vehicle or not operator or psi_measured is None or psi_recommended is None:
+            QMessageBox.warning(
+                self,
+                "Missing Session Data",
+                "Please fill Vehicle, Operator, PSI Measured, and PSI Recommended before capture.",
+            )
+            return
+
         frame = self.video.frame_bgr.copy()
         roi_bgr = crop_roi(frame, self.roi)
 
@@ -451,7 +550,11 @@ class MainWindow(QMainWindow):
         q = run_quality_checks(processed["gray"], self.cfg)
         edges = processed.get("edges_closed", processed.get("edges"))
         m = groove_visibility_score(edges)
-        verdict = pass_fail_from_score(float(m["score"]))
+        tread_verdict = pass_fail_from_score(float(m["score"]))
+        psi_status = self._psi_verdict(psi_measured, psi_recommended)
+        verdict = tread_verdict
+        if psi_status == "CRITICAL":
+            verdict = "REPLACE"
 
         meta = {
             "camera_index": self.cam_index,
@@ -460,9 +563,14 @@ class MainWindow(QMainWindow):
             "measure": m,
             "verdict": verdict,
             "session": {
-                "vehicle_id": self.in_vehicle.text().strip() or None,
+                "vehicle_id": vehicle or None,
                 "tire_position": self.in_tire.currentText(),
-                "operator": self.in_operator.text().strip() or None,
+                "operator": operator or None,
+                "psi_measured": psi_measured,
+                "psi_recommended": psi_recommended,
+                "psi_status": psi_status,
+                "psi_good_delta": self._get_psi_settings()[0],
+                "psi_warn_delta": self._get_psi_settings()[1],
                 "session_notes": self.in_notes.text().strip() or None,
             },
         }
@@ -486,21 +594,29 @@ class MainWindow(QMainWindow):
                 "continuity": float(m["continuity"]),
                 "score": float(m["score"]),
                 "verdict": verdict,
+                "tread_verdict": tread_verdict,
+                "psi_measured": psi_measured,
+                "psi_recommended": psi_recommended,
+                "psi_status": psi_status,
                 "notes": "; ".join(q["reasons"]) if not q["ok"] else "",
-                "vehicle_id": self.in_vehicle.text().strip() or None,
+                "vehicle_id": vehicle or None,
                 "tire_position": self.in_tire.currentText(),
-                "operator": self.in_operator.text().strip() or None,
+                "operator": operator or None,
                 "session_notes": self.in_notes.text().strip() or None,
             },
         )
 
         self.result.setPlainText(
             f"TS: {ts}\n"
-            f"Vehicle: {self.in_vehicle.text().strip() or '-'}\n"
+            f"Vehicle: {vehicle or '-'}\n"
             f"Tire: {self.in_tire.currentText()}\n"
-            f"Operator: {self.in_operator.text().strip() or '-'}\n"
+            f"Operator: {operator or '-'}\n"
+            f"PSI Measured: {psi_measured:.1f}\n"
+            f"PSI Recommended: {psi_recommended:.1f}\n"
+            f"PSI Status: {psi_status}\n"
+            f"Tread Verdict: {tread_verdict}\n"
             f"Score: {float(m['score']):.4f}\n"
-            f"Verdict: {verdict}\n"
+            f"Final Verdict: {verdict}\n"
             f"Brightness: {float(q['metrics']['brightness']):.2f}\n"
             f"Sharpness: {float(q['metrics']['sharpness']):.2f}\n"
         )
@@ -534,6 +650,10 @@ class MainWindow(QMainWindow):
             f"Vehicle: {row.get('vehicle_id') or '-'}\n"
             f"Tire: {row.get('tire_position') or '-'}\n"
             f"Operator: {row.get('operator') or '-'}\n"
+            f"PSI Measured: {row.get('psi_measured') if row.get('psi_measured') is not None else '-'}\n"
+            f"PSI Recommended: {row.get('psi_recommended') if row.get('psi_recommended') is not None else '-'}\n"
+            f"PSI Status: {row.get('psi_status') or '-'}\n"
+            f"Tread Verdict: {row.get('tread_verdict') or '-'}\n"
             f"Score: {float(row.get('score') or 0.0):.4f}\n"
             f"Verdict: {row.get('verdict') or '-'}\n"
             f"Processed files: {', '.join(sorted(imgs.keys())) if imgs else 'none'}\n"
