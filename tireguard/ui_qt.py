@@ -720,10 +720,22 @@ class MainWindow(QMainWindow):
         sess = QWidget()
         sess.setObjectName("sessionContainer")
         f = QFormLayout()
+
+        # --- Vehicle Type ---
+        self.in_vehicle_type = QComboBox()
+        self.in_vehicle_type.addItems(["Car", "Motorcycle"])
+        self.in_vehicle_type.currentTextChanged.connect(self._on_vehicle_type_changed)
+
         self.in_vehicle = QLineEdit()
+        self.in_vehicle.setPlaceholderText("e.g. ABC-1234")
+
+        self.in_tire_model = QLineEdit()
+        self.in_tire_model.setPlaceholderText("e.g. Michelin Pilot Sport 4")
+
         self.in_operator = QLineEdit()
         self.in_tirepos = QComboBox()
-        self.in_tirepos.addItems(["FL","FR","RL","RR","SPARE"])
+        self.in_tirepos.addItems(["FL", "FR", "RL", "RR", "SPARE"])
+
         self.in_notes = QLineEdit()
 
         self.in_psi_measured = QLineEdit()
@@ -735,8 +747,40 @@ class MainWindow(QMainWindow):
         self.in_psi_measured.setValidator(psi_validator)
         self.in_psi_recommended.setValidator(psi_validator)
 
+        # --- Tire Type ---
+        self.in_tire_type = QComboBox()
+        self.in_tire_type.addItems([
+            "— Select —",
+            # Standard Types
+            "All-Season Tires",
+            "Summer Tires",
+            "Winter/Snow Tires",
+            "All-Terrain Tires",
+            "Performance Tires",
+            "Touring Tires",
+            "Mud-Terrain Tires",
+            "Run-Flat Tires",
+            # Specialty
+            "Competition Tires",
+            "Eco-Friendly Tires",
+            "Spare Tires",
+        ])
+
+        # --- Tread Design ---
+        self.in_tread_design = QComboBox()
+        self.in_tread_design.addItems([
+            "— Select —",
+            "Symmetrical",
+            "Asymmetrical",
+            "Directional",
+        ])
+
+        f.addRow("Vehicle Type", self.in_vehicle_type)
         f.addRow("Vehicle ID", self.in_vehicle)
-        f.addRow("Tire", self.in_tirepos)
+        f.addRow("Tire Model Code", self.in_tire_model)
+        f.addRow("Tire Position", self.in_tirepos)
+        f.addRow("Tire Type", self.in_tire_type)
+        f.addRow("Tread Design", self.in_tread_design)
         f.addRow("Operator", self.in_operator)
         f.addRow("Notes", self.in_notes)
         f.addRow("Measured PSI", self.in_psi_measured)
@@ -1376,6 +1420,14 @@ class MainWindow(QMainWindow):
         self.cfg.min_sharpness = float(self.sp_min_sharp.value())
         self.toast.show_toast("✅ Thresholds applied")
 
+    def _on_vehicle_type_changed(self, vehicle_type: str):
+        """Update tire position options when vehicle type changes."""
+        self.in_tirepos.clear()
+        if vehicle_type == "Motorcycle":
+            self.in_tirepos.addItems(["F (Front)", "R (Rear)"])
+        else:
+            self.in_tirepos.addItems(["FL", "FR", "RL", "RR", "SPARE"])
+
     def _to_float_or_none(self, text: str) -> Optional[float]:
         try:
             t = (text or "").strip()
@@ -1502,8 +1554,12 @@ class MainWindow(QMainWindow):
                     "status": psi_status,
                 },
                 "session": {
+                    "vehicle_type": self.in_vehicle_type.currentText() if hasattr(self, "in_vehicle_type") else None,
                     "vehicle_id": self.in_vehicle.text().strip() or None,
+                    "tire_model_code": self.in_tire_model.text().strip() or None,
                     "tire_position": self.in_tirepos.currentText().strip() or None,
+                    "tire_type": self.in_tire_type.currentText() if hasattr(self, "in_tire_type") else None,
+                    "tread_design": self.in_tread_design.currentText() if hasattr(self, "in_tread_design") else None,
                     "operator": self.in_operator.text().strip() or None,
                     "notes": self.in_notes.text().strip() or None,
                 },
@@ -1512,6 +1568,9 @@ class MainWindow(QMainWindow):
             save_processed(self.cfg, ts, processed)
 
             mm_per_px = self.calib.get("mm_per_px") if isinstance(self.calib, dict) else None
+            _vtype = self.in_vehicle_type.currentText() if hasattr(self, "in_vehicle_type") else None
+            _tire_type_val = self.in_tire_type.currentText() if hasattr(self, "in_tire_type") else None
+            _tread_val = self.in_tread_design.currentText() if hasattr(self, "in_tread_design") else None
             insert_result(self.cfg, {
                 "ts": ts,
                 "image_path": str(img_path),
@@ -1531,8 +1590,12 @@ class MainWindow(QMainWindow):
                 "psi_recommended": float(psi_recommended) if psi_recommended is not None else PSI_DEFAULT_RECOMMENDED,
                 "psi_status": psi_status,
                 "notes": "; ".join(q["reasons"]) if q.get("reasons") else "",
+                "vehicle_type": _vtype if _vtype and _vtype not in ("— Select —",) else None,
                 "vehicle_id": self.in_vehicle.text().strip() or None,
+                "tire_model_code": self.in_tire_model.text().strip() or None,
                 "tire_position": self.in_tirepos.currentText().strip() or None,
+                "tire_type": _tire_type_val if _tire_type_val and _tire_type_val != "— Select —" else None,
+                "tread_design": _tread_val if _tread_val and _tread_val != "— Select —" else None,
                 "operator": self.in_operator.text().strip() or None,
                 "session_notes": self.in_notes.text().strip() or None,
                 "mm_per_px": float(mm_per_px) if mm_per_px else None,

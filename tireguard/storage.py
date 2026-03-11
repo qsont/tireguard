@@ -39,6 +39,77 @@ def _col_exists(cur, table, col):
     cur.execute(f"PRAGMA table_info({table})")
     return any(r[1] == col for r in cur.fetchall())
 
+
+def _capture_meta_path_for_ts(cfg, ts: str) -> Path:
+    return cfg.captures_dir / f"tire_{ts}.json"
+
+
+def _backfill_results_metadata(cfg):
+    """Backfill new metadata columns from capture JSON for older rows.
+
+    This is idempotent and only updates rows where one or more new fields are missing.
+    """
+    con = sqlite3.connect(cfg.db_path)
+    con.row_factory = sqlite3.Row
+    cur = con.cursor()
+
+    cur.execute(
+        """
+        SELECT id, ts, vehicle_type, tire_model_code, tire_type, tread_design
+        FROM results
+        WHERE vehicle_type IS NULL
+           OR tire_model_code IS NULL
+           OR tire_type IS NULL
+           OR tread_design IS NULL
+        """
+    )
+    rows = cur.fetchall()
+
+    for row in rows:
+        ts = row["ts"]
+        if not ts:
+            continue
+        meta_path = _capture_meta_path_for_ts(cfg, ts)
+        if not meta_path.exists():
+            continue
+        try:
+            payload = json.loads(meta_path.read_text(encoding="utf-8"))
+        except Exception:
+            continue
+
+        session = payload.get("session") if isinstance(payload, dict) else None
+        if not isinstance(session, dict):
+            continue
+
+        vehicle_type = session.get("vehicle_type")
+        tire_model_code = session.get("tire_model_code")
+        tire_type = session.get("tire_type")
+        tread_design = session.get("tread_design")
+
+        if all(v in (None, "", "-", "—") for v in [vehicle_type, tire_model_code, tire_type, tread_design]):
+            continue
+
+        cur.execute(
+            """
+            UPDATE results
+            SET vehicle_type = COALESCE(vehicle_type, ?),
+                tire_model_code = COALESCE(tire_model_code, ?),
+                tire_type = COALESCE(tire_type, ?),
+                tread_design = COALESCE(tread_design, ?)
+            WHERE id = ?
+            """,
+            (
+                vehicle_type if vehicle_type not in ("", "-", "—") else None,
+                tire_model_code if tire_model_code not in ("", "-", "—") else None,
+                tire_type if tire_type not in ("", "-", "—") else None,
+                tread_design if tread_design not in ("", "-", "—") else None,
+                row["id"],
+            ),
+        )
+
+    con.commit()
+    con.close()
+
 def init_db(cfg):
     ensure_dirs(cfg)
     con = sqlite3.connect(cfg.db_path)
@@ -76,6 +147,11 @@ def init_db(cfg):
         ("psi_measured", "REAL"),
         ("psi_recommended", "REAL"),
         ("psi_status", "TEXT"),
+        # Extended metadata fields
+        ("vehicle_type", "TEXT"),
+        ("tire_model_code", "TEXT"),
+        ("tire_type", "TEXT"),
+        ("tread_design", "TEXT"),
     ]
     for col, typ in migrations:
         if not _col_exists(cur, "results", col):
@@ -101,6 +177,9 @@ def init_db(cfg):
 
     con.commit()
     con.close()
+
+    # Backfill new metadata fields for existing records where possible.
+    _backfill_results_metadata(cfg)
 
 def save_capture(cfg, frame_bgr, meta: dict):
     ensure_dirs(cfg)
@@ -182,7 +261,17 @@ def insert_validation_result(cfg, row: dict):
     con.close()
 
 
-def list_results(cfg, limit=30, vehicle_id=None, tire_position=None, verdict=None):
+def list_results(
+    cfg,
+    limit=30,
+    vehicle_id=None,
+    tire_position=None,
+    verdict=None,
+    vehicle_type=None,
+    tire_type=None,
+    tread_design=None,
+    tire_model_code=None,
+):
     con = sqlite3.connect(cfg.db_path)
     cur = con.cursor()
 
@@ -198,12 +287,27 @@ def list_results(cfg, limit=30, vehicle_id=None, tire_position=None, verdict=Non
     if verdict:
         where.append("verdict = ?")
         params.append(verdict)
+    if vehicle_type:
+        where.append("vehicle_type = ?")
+        params.append(vehicle_type)
+    if tire_type:
+        where.append("tire_type = ?")
+        params.append(tire_type)
+    if tread_design:
+        where.append("tread_design = ?")
+        params.append(tread_design)
+    if tire_model_code:
+        where.append("tire_model_code = ?")
+        params.append(tire_model_code)
 
     where_sql = ("WHERE " + " AND ".join(where)) if where else ""
 
     cur.execute(f"""
         SELECT 
-            ts, verdict, score, vehicle_id, tire_position, operator,
+            ts, verdict, score,
+            vehicle_type, vehicle_id, tire_model_code,
+            tire_position, tire_type, tread_design,
+            operator,
             brightness, sharpness, edge_density, continuity,
             psi_measured, psi_recommended, psi_status, tread_verdict
         FROM results
@@ -218,17 +322,21 @@ def list_results(cfg, limit=30, vehicle_id=None, tire_position=None, verdict=Non
             "ts": r[0],
             "verdict": r[1],
             "score": r[2],
-            "vehicle_id": r[3],
-            "tire_position": r[4],
-            "operator": r[5],
-            "brightness": r[6],
-            "sharpness": r[7],
-            "edge_density": r[8],
-            "continuity": r[9],
-            "psi_measured": r[10],
-            "psi_recommended": r[11],
-            "psi_status": r[12],
-            "tread_verdict": r[13],
+            "vehicle_type": r[3],
+            "vehicle_id": r[4],
+            "tire_model_code": r[5],
+            "tire_position": r[6],
+            "tire_type": r[7],
+            "tread_design": r[8],
+            "operator": r[9],
+            "brightness": r[10],
+            "sharpness": r[11],
+            "edge_density": r[12],
+            "continuity": r[13],
+            "psi_measured": r[14],
+            "psi_recommended": r[15],
+            "psi_status": r[16],
+            "tread_verdict": r[17],
         }
         for r in rows
     ]
@@ -240,7 +348,8 @@ def get_result_by_ts(cfg, ts: str):
         SELECT ts,image_path,roi_x,roi_y,roi_w,roi_h,
                brightness,glare_ratio,sharpness,
                edge_density,continuity,score,verdict,notes,
-               vehicle_id,tire_position,operator,session_notes,mm_per_px,
+               vehicle_type,vehicle_id,tire_model_code,tire_position,tire_type,tread_design,
+               operator,session_notes,mm_per_px,
                tread_verdict,psi_measured,psi_recommended,psi_status
         FROM results
         WHERE ts=?
@@ -253,7 +362,8 @@ def get_result_by_ts(cfg, ts: str):
     keys = ["ts","image_path","roi_x","roi_y","roi_w","roi_h",
             "brightness","glare_ratio","sharpness",
             "edge_density","continuity","score","verdict","notes",
-            "vehicle_id","tire_position","operator","session_notes","mm_per_px",
+            "vehicle_type","vehicle_id","tire_model_code","tire_position","tire_type","tread_design",
+            "operator","session_notes","mm_per_px",
             "tread_verdict","psi_measured","psi_recommended","psi_status"]
     return dict(zip(keys, row))
 
@@ -273,7 +383,9 @@ def export_csv(cfg):
     cur = con.cursor()
 
     COLUMNS = [
-        "ts","image_path","vehicle_id","tire_position","operator","session_notes",
+        "ts","image_path","vehicle_type","vehicle_id","tire_model_code",
+        "tire_position","tire_type","tread_design",
+        "operator","session_notes",
         "brightness","glare_ratio","sharpness",
         "edge_density","continuity","score","verdict","tread_verdict",
         "psi_measured","psi_recommended","psi_status",

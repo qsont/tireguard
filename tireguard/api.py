@@ -74,10 +74,29 @@ def health():
 
 # ---------- Recent Scans ----------
 @app.get("/api/scans")
-def scans(limit: int = Query(50, ge=1, le=500)):
+def scans(
+    limit: int = Query(50, ge=1, le=500),
+    vehicle_id: str | None = None,
+    tire_position: str | None = None,
+    verdict: str | None = None,
+    vehicle_type: str | None = None,
+    tire_type: str | None = None,
+    tread_design: str | None = None,
+    tire_model_code: str | None = None,
+):
     """List recent scan results with filtering support."""
     cfg = _cfg()
-    rows = list_results(cfg, limit=limit)
+    rows = list_results(
+        cfg,
+        limit=limit,
+        vehicle_id=vehicle_id,
+        tire_position=tire_position,
+        verdict=verdict,
+        vehicle_type=vehicle_type,
+        tire_type=tire_type,
+        tread_design=tread_design,
+        tire_model_code=tire_model_code,
+    )
     return _jsonify({"items": rows, "limit": limit})
 
 
@@ -948,18 +967,62 @@ def index():
             </select>
           </div>
           <div class="filter-group">
+            <label for="fVehicleType">Vehicle Type</label>
+            <select id="fVehicleType" class="filter-control">
+              <option value="">All types</option>
+              <option value="Car">Car</option>
+              <option value="Motorcycle">Motorcycle</option>
+            </select>
+          </div>
+          <div class="filter-group">
             <label for="fVehicle">Vehicle ID</label>
             <input type="text" id="fVehicle" placeholder="Enter vehicle ID" class="filter-control">
+          </div>
+          <div class="filter-group">
+            <label for="fModel">Tire Model Code</label>
+            <input type="text" id="fModel" placeholder="Enter tire model" class="filter-control">
           </div>
           <div class="filter-group">
             <label for="fTire">Tire Position</label>
             <select id="fTire" class="filter-control">
               <option value="">All positions</option>
-              <option>FL</option>
-              <option>FR</option>
-              <option>RL</option>
-              <option>RR</option>
-              <option>SPARE</option>
+              <optgroup label="Car">
+                <option>FL</option>
+                <option>FR</option>
+                <option>RL</option>
+                <option>RR</option>
+                <option>SPARE</option>
+              </optgroup>
+              <optgroup label="Motorcycle">
+                <option>F (Front)</option>
+                <option>R (Rear)</option>
+              </optgroup>
+            </select>
+          </div>
+          <div class="filter-group">
+            <label for="fTireType">Tire Type</label>
+            <select id="fTireType" class="filter-control">
+              <option value="">All tire types</option>
+              <option>All-Season Tires</option>
+              <option>Summer Tires</option>
+              <option>Winter/Snow Tires</option>
+              <option>All-Terrain Tires</option>
+              <option>Performance Tires</option>
+              <option>Touring Tires</option>
+              <option>Mud-Terrain Tires</option>
+              <option>Run-Flat Tires</option>
+              <option>Competition Tires</option>
+              <option>Eco-Friendly Tires</option>
+              <option>Spare Tires</option>
+            </select>
+          </div>
+          <div class="filter-group">
+            <label for="fTreadDesign">Tread Design</label>
+            <select id="fTreadDesign" class="filter-control">
+              <option value="">All designs</option>
+              <option>Symmetrical</option>
+              <option>Asymmetrical</option>
+              <option>Directional</option>
             </select>
           </div>
           <div class="filter-group">
@@ -979,8 +1042,12 @@ def index():
               <th>Timestamp</th>
               <th>Verdict</th>
               <th>Score</th>
-              <th>Tire</th>
+              <th>Veh. Type</th>
               <th>Vehicle</th>
+              <th>Tire Model</th>
+              <th>Tire</th>
+              <th>Tire Type</th>
+              <th>Tread Design</th>
               <th>Operator</th>
               <th>Brightness</th>
               <th>Sharpness</th>
@@ -1011,12 +1078,28 @@ def index():
 
         <div class="scan-info">
           <div class="info-item">
+            <div class="info-label">Vehicle Type</div>
+            <div class="info-value" id="selVehicleType">—</div>
+          </div>
+          <div class="info-item">
             <div class="info-label">Vehicle ID</div>
             <div class="info-value" id="selVehicle">—</div>
           </div>
           <div class="info-item">
+            <div class="info-label">Tire Model Code</div>
+            <div class="info-value" id="selTireModel">—</div>
+          </div>
+          <div class="info-item">
             <div class="info-label">Tire Position</div>
             <div class="info-value" id="selTire">—</div>
+          </div>
+          <div class="info-item">
+            <div class="info-label">Tire Type</div>
+            <div class="info-value" id="selTireType">—</div>
+          </div>
+          <div class="info-item">
+            <div class="info-label">Tread Design</div>
+            <div class="info-value" id="selTreadDesign">—</div>
           </div>
           <div class="info-item">
             <div class="info-label">Operator</div>
@@ -1243,14 +1326,26 @@ def index():
 
     function applyFilters(items) {
       const v = $("fVehicle").value.trim().toLowerCase();
+      const vt = $("fVehicleType").value.trim().toLowerCase();
+      const model = $("fModel").value.trim().toLowerCase();
       const t = $("fTire").value.trim().toUpperCase();
+      const tt = $("fTireType").value.trim().toLowerCase();
+      const td = $("fTreadDesign").value.trim().toLowerCase();
       const vd = $("fVerdict").value.trim().toUpperCase();
       return items.filter(r => {
         const rv = (r.vehicle_id ?? r["vehicle_id"] ?? "").toString().toLowerCase();
+        const rvt = (r.vehicle_type ?? r["vehicle_type"] ?? "").toString().toLowerCase();
+        const rmodel = (r.tire_model_code ?? r["tire_model_code"] ?? "").toString().toLowerCase();
         const rt = (r.tire_position ?? r["tire_position"] ?? "").toString().toUpperCase();
+        const rtt = (r.tire_type ?? r["tire_type"] ?? "").toString().toLowerCase();
+        const rtd = (r.tread_design ?? r["tread_design"] ?? "").toString().toLowerCase();
         const rvd = (r.verdict ?? r["verdict"] ?? "").toString().toUpperCase();
         if (v && !rv.includes(v)) return false;
+        if (vt && rvt !== vt) return false;
+        if (model && !rmodel.includes(model)) return false;
         if (t && rt !== t) return false;
+        if (tt && rtt !== tt) return false;
+        if (td && rtd !== td) return false;
         if (vd && rvd !== vd) return false;
         return true;
       });
@@ -1288,7 +1383,23 @@ def index():
       status("Loading scans...");
       const limit = Number($("limit").value || 50);
       try {
-        const res = await api(`/api/scans?limit=${limit}`);
+        const query = new URLSearchParams();
+        query.set("limit", String(limit));
+
+        const qVehicleType = $("fVehicleType").value.trim();
+        const qTire = $("fTire").value.trim();
+        const qVerdict = $("fVerdict").value.trim();
+        const qTireType = $("fTireType").value.trim();
+        const qTreadDesign = $("fTreadDesign").value.trim();
+
+        // Send exact-match filters to API; keep text contains filters client-side.
+        if (qVehicleType) query.set("vehicle_type", qVehicleType);
+        if (qTire) query.set("tire_position", qTire);
+        if (qVerdict) query.set("verdict", qVerdict);
+        if (qTireType) query.set("tire_type", qTireType);
+        if (qTreadDesign) query.set("tread_design", qTreadDesign);
+
+        const res = await api(`/api/scans?${query.toString()}`);
         const data = await res.json();
         const items = Array.isArray(data.items) ? data.items : [];
         const filtered = applyFilters(items);
@@ -1298,7 +1409,7 @@ def index():
         if (filtered.length === 0) {
           tbody.innerHTML = `
             <tr>
-              <td colspan="13" style="text-align: center; padding: 2rem; color: #6c757d;">
+              <td colspan="17" style="text-align: center; padding: 2rem; color: #6c757d;">
                 <i class="fas fa-search" style="font-size: 2rem; margin-bottom: 1rem; opacity: 0.3;"></i>
                 <p>No scans match your criteria</p>
                 <button id="resetFilters" class="btn btn-outline" style="margin-top: 1rem;">
@@ -1308,8 +1419,12 @@ def index():
             </tr>
           `;
           $("resetFilters").onclick = () => {
+            $("fVehicleType").value = "";
             $("fVehicle").value = "";
+            $("fModel").value = "";
             $("fTire").value = "";
+            $("fTireType").value = "";
+            $("fTreadDesign").value = "";
             $("fVerdict").value = "";
             loadScans();
           };
@@ -1329,8 +1444,12 @@ def index():
             const ts = get("ts", "-");
             const verdict = get("verdict", "—");
             const score = get("score", "-");
-            const tire = get("tire_position", "-");
+            const vehicleType = get("vehicle_type", "-");
             const vehicle = get("vehicle_id", "-");
+            const tireModel = get("tire_model_code", "-");
+            const tire = get("tire_position", "-");
+            const tireType = get("tire_type", "-");
+            const treadDesign = get("tread_design", "-");
             const operator = get("operator", "-");
             const brightness = get("brightness", "-");
             const sharpness = get("sharpness", "-");
@@ -1344,8 +1463,12 @@ def index():
               <td>${ts}</td>
               <td><span class="verdict-badge ${verdictClass(verdict)}">${verdict}</span></td>
               <td>${score}</td>
-              <td>${tire}</td>
+              <td>${vehicleType}</td>
               <td>${vehicle}</td>
+              <td>${tireModel}</td>
+              <td>${tire}</td>
+              <td>${tireType}</td>
+              <td>${treadDesign}</td>
               <td>${operator}</td>
               <td>${brightness}</td>
               <td>${sharpness}</td>
@@ -1387,8 +1510,12 @@ def index():
         $("selVerdict").textContent = verdict || "—";
         $("selVerdict").style.display = verdict ? 'inline-block' : 'none';
 
+        $("selVehicleType").textContent = row.vehicle_type || "—";
         $("selVehicle").textContent = row.vehicle_id || "—";
+        $("selTireModel").textContent = row.tire_model_code || "—";
         $("selTire").textContent = row.tire_position || "—";
+        $("selTireType").textContent = row.tire_type || "—";
+        $("selTreadDesign").textContent = row.tread_design || "—";
         $("selOperator").textContent = row.operator || "—";
         $("selTimestamp").textContent = row.ts || "—";
         $("selBrightness").textContent = nfmt(row.brightness, 2);
@@ -1637,7 +1764,7 @@ def index():
     };
 
     // Also update valTbody to include notes column
-    ["fVehicle", "fTire", "fVerdict", "limit"].forEach(id => {
+    ["fVehicleType", "fVehicle", "fModel", "fTire", "fTireType", "fTreadDesign", "fVerdict", "limit"].forEach(id => {
       const el = $(id);
       if (el) el.addEventListener("change", loadScans);
       if (el) el.addEventListener("input", () => {

@@ -1,1 +1,2 @@
-ts,image_path,vehicle_id,tire_position,operator,session_notes,brightness,glare_ratio,sharpness,edge_density,continuity,score,verdict,mm_per_px,notes
+ts,image_path,vehicle_id,tire_position,operator,session_notes,brightness,glare_ratio,sharpness,edge_density,continuity,score,verdict,tread_verdict,psi_measured,psi_recommended,psi_status,mm_per_px,notes
+20260312_065525,data/captures/tire_20260312_065525.jpg,1G1FF1R7XH0185757,FL,Sam Witwicky,test for Vehicle ID Camaro 2017,90.82494212962963,0.0,5.80888965096784,0.009323559670781892,72.5,0.01702106354276807,REPLACE,REPLACE,32.0,32.0,GOOD,,Too blurry (sharpness=5.8)

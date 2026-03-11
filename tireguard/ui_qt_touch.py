@@ -320,10 +320,45 @@ class MainWindow(QMainWindow):
         self.sess_form = QFormLayout(tab_session)
         self.sess_form.setContentsMargins(8, 8, 8, 8)
         self.sess_form.setSpacing(6)
+
+        # --- Vehicle Type ---
+        self.in_vehicle_type = QComboBox()
+        self.in_vehicle_type.addItems(["Car", "Motorcycle"])
+        self.in_vehicle_type.currentTextChanged.connect(self._on_vehicle_type_changed)
+
         self.in_vehicle = QLineEdit()
         self.in_vehicle.setPlaceholderText("Vehicle ID")
+
+        self.in_tire_model = QLineEdit()
+        self.in_tire_model.setPlaceholderText("e.g. Michelin Pilot Sport 4")
+
         self.in_tire = QComboBox()
         self.in_tire.addItems(["FL", "FR", "RL", "RR", "SPARE"])
+
+        self.in_tire_type = QComboBox()
+        self.in_tire_type.addItems([
+            "— Select —",
+            "All-Season Tires",
+            "Summer Tires",
+            "Winter/Snow Tires",
+            "All-Terrain Tires",
+            "Performance Tires",
+            "Touring Tires",
+            "Mud-Terrain Tires",
+            "Run-Flat Tires",
+            "Competition Tires",
+            "Eco-Friendly Tires",
+            "Spare Tires",
+        ])
+
+        self.in_tread_design = QComboBox()
+        self.in_tread_design.addItems([
+            "— Select —",
+            "Symmetrical",
+            "Asymmetrical",
+            "Directional",
+        ])
+
         self.in_operator = QLineEdit()
         self.in_operator.setPlaceholderText("Operator")
         self.in_notes = QLineEdit()
@@ -334,8 +369,13 @@ class MainWindow(QMainWindow):
         self.in_psi_recommended.setPlaceholderText("Recommended PSI (e.g., 32.0)")
         self.psi_status = QLabel("PSI Status: -")
         self.psi_status.setStyleSheet("color:#9fd9ff; font-size:14px; font-weight:700;")
-        self.sess_form.addRow("Vehicle", self.in_vehicle)
-        self.sess_form.addRow("Tire", self.in_tire)
+
+        self.sess_form.addRow("Vehicle Type", self.in_vehicle_type)
+        self.sess_form.addRow("Vehicle ID", self.in_vehicle)
+        self.sess_form.addRow("Tire Model Code", self.in_tire_model)
+        self.sess_form.addRow("Tire Position", self.in_tire)
+        self.sess_form.addRow("Tire Type", self.in_tire_type)
+        self.sess_form.addRow("Tread Design", self.in_tread_design)
         self.sess_form.addRow("Operator", self.in_operator)
         self.sess_form.addRow("PSI Measured", self.in_psi_measured)
         self.sess_form.addRow("PSI Recommended", self.in_psi_recommended)
@@ -562,6 +602,14 @@ class MainWindow(QMainWindow):
             return f"WARN {direction}"
         return f"CRITICAL {direction}"
 
+    def _on_vehicle_type_changed(self, vehicle_type: str):
+        """Update tire position options when vehicle type changes."""
+        self.in_tire.clear()
+        if vehicle_type == "Motorcycle":
+            self.in_tire.addItems(["F (Front)", "R (Rear)"])
+        else:
+            self.in_tire.addItems(["FL", "FR", "RL", "RR", "SPARE"])
+
     def _get_psi_settings(self) -> Tuple[float, float, float]:
         good = self._to_float_or_none(self.psi_good_input.text()) if hasattr(self, "psi_good_input") else None
         warn = self._to_float_or_none(self.psi_warn_input.text()) if hasattr(self, "psi_warn_input") else None
@@ -684,8 +732,12 @@ class MainWindow(QMainWindow):
             "measure": m,
             "verdict": verdict,
             "session": {
+                "vehicle_type": self.in_vehicle_type.currentText(),
                 "vehicle_id": vehicle or None,
+                "tire_model_code": self.in_tire_model.text().strip() or None,
                 "tire_position": self.in_tire.currentText(),
+                "tire_type": self.in_tire_type.currentText() if self.in_tire_type.currentText() != "— Select —" else None,
+                "tread_design": self.in_tread_design.currentText() if self.in_tread_design.currentText() != "— Select —" else None,
                 "operator": operator or None,
                 "psi_measured": psi_measured,
                 "psi_recommended": psi_recommended,
@@ -720,8 +772,12 @@ class MainWindow(QMainWindow):
                 "psi_recommended": psi_recommended,
                 "psi_status": psi_status,
                 "notes": "; ".join(q["reasons"]) if not q["ok"] else "",
+                "vehicle_type": self.in_vehicle_type.currentText(),
                 "vehicle_id": vehicle or None,
+                "tire_model_code": self.in_tire_model.text().strip() or None,
                 "tire_position": self.in_tire.currentText(),
+                "tire_type": self.in_tire_type.currentText() if self.in_tire_type.currentText() != "— Select —" else None,
+                "tread_design": self.in_tread_design.currentText() if self.in_tread_design.currentText() != "— Select —" else None,
                 "operator": operator or None,
                 "session_notes": self.in_notes.text().strip() or None,
             },
@@ -729,8 +785,12 @@ class MainWindow(QMainWindow):
 
         self.result.setPlainText(
             f"TS: {ts}\n"
+            f"Vehicle Type: {self.in_vehicle_type.currentText()}\n"
             f"Vehicle: {vehicle or '-'}\n"
+            f"Tire Model: {self.in_tire_model.text().strip() or '-'}\n"
             f"Tire: {self.in_tire.currentText()}\n"
+            f"Tire Type: {self.in_tire_type.currentText()}\n"
+            f"Tread Design: {self.in_tread_design.currentText()}\n"
             f"Operator: {operator or '-'}\n"
             f"PSI Measured: {psi_measured:.1f}\n"
             f"PSI Recommended: {psi_recommended:.1f}\n"
