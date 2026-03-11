@@ -405,7 +405,9 @@ class MainWindow(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setWidget(page)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        # Keep all tabs navigable on 5-inch screens when content exceeds viewport.
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         return scroll
 
     def _set_status(self, text: str):
@@ -437,22 +439,26 @@ class MainWindow(QMainWindow):
         if not hasattr(self, "body_layout") or not hasattr(self, "tabs"):
             return
         if self.isFullScreen():
-            # Fullscreen keeps the existing stacked composition.
-            self.body_layout.setDirection(QBoxLayout.TopToBottom)
-            self.body_layout.setStretch(0, 3)
-            self.body_layout.setStretch(1, 2)
+            # Fullscreen uses the same optimized side-by-side composition as windowed mode.
+            self.body_layout.setDirection(QBoxLayout.LeftToRight)
+            self.body_layout.setStretch(0, 4)
+            self.body_layout.setStretch(1, 5)
             self.tabs.setTabPosition(QTabWidget.North)
             self.tabs.setStyleSheet(
-                "QTabBar::tab { min-height: 32px; min-width: 110px; font-size: 15px; font-weight: 700; }"
+                "QTabBar::tab { min-height: 30px; min-width: 92px; font-size: 14px; font-weight: 700; }"
             )
             if hasattr(self, "scan_buttons1"):
-                self.scan_buttons1.setDirection(QBoxLayout.LeftToRight)
+                self.scan_buttons1.setDirection(QBoxLayout.TopToBottom)
             if hasattr(self, "scan_buttons2"):
-                self.scan_buttons2.setDirection(QBoxLayout.LeftToRight)
+                self.scan_buttons2.setDirection(QBoxLayout.TopToBottom)
             if hasattr(self, "sess_form"):
-                self.sess_form.setRowWrapPolicy(QFormLayout.DontWrapRows)
+                self.sess_form.setRowWrapPolicy(QFormLayout.WrapAllRows)
+            compact_btn_style = "QPushButton { min-height: 40px; font-size: 13px; padding: 4px 8px; border-radius: 8px; }"
             for btn in (self.btn_roi, self.btn_auto_roi, self.btn_clear_roi, self.btn_capture, self.btn_export):
-                btn.setStyleSheet("")
+                btn.setStyleSheet(compact_btn_style)
+            compact_input_style = (
+                "QLineEdit, QComboBox { min-height: 30px; font-size: 13px; padding: 4px; border-radius: 7px; }"
+            )
             for w in (
                 self.in_vehicle,
                 self.in_operator,
@@ -461,9 +467,9 @@ class MainWindow(QMainWindow):
                 self.in_psi_recommended,
                 self.in_tire,
             ):
-                w.setStyleSheet("")
-            self.result.setMinimumHeight(88)
-            self.result.setMaximumHeight(120)
+                w.setStyleSheet(compact_input_style)
+            self.result.setMinimumHeight(66)
+            self.result.setMaximumHeight(96)
         else:
             # Windowed 800x480: camera on left, entire tab section on right.
             self.body_layout.setDirection(QBoxLayout.LeftToRight)
