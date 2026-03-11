@@ -7,6 +7,7 @@ from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QDoubleValidator, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QBoxLayout,
     QComboBox,
     QFormLayout,
     QHBoxLayout,
@@ -256,38 +257,58 @@ class MainWindow(QMainWindow):
         top.addWidget(self.status)
         root.addLayout(top)
 
+        body = QWidget()
+        self.body_layout = QBoxLayout(QBoxLayout.TopToBottom)
+        self.body_layout.setContentsMargins(0, 0, 0, 0)
+        self.body_layout.setSpacing(6)
+        body.setLayout(self.body_layout)
+        root.addWidget(body, 1)
+
+        self.left_panel = QWidget()
+        left_layout = QVBoxLayout(self.left_panel)
+        left_layout.setContentsMargins(0, 0, 0, 0)
+        left_layout.setSpacing(6)
+
         self.roi_info = QLabel("ROI: not set")
         self.roi_info.setStyleSheet("color:#cde9ff; font-size:14px; font-weight:700;")
-        root.addWidget(self.roi_info)
+        left_layout.addWidget(self.roi_info)
 
         self.video = TouchVideo()
         self.video.on_roi_selected = self._on_roi_selected
-        root.addWidget(self.video, 3)
+        left_layout.addWidget(self.video, 1)
 
-        tabs = QTabWidget()
-        tabs.setStyleSheet("QTabBar::tab { min-height: 32px; min-width: 110px; font-size: 15px; font-weight: 700; }")
-        root.addWidget(tabs, 2)
+        self.right_panel = QWidget()
+        right_layout = QVBoxLayout(self.right_panel)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.setSpacing(0)
+
+        self.tabs = QTabWidget()
+        self.tabs.setStyleSheet("QTabBar::tab { min-height: 32px; min-width: 110px; font-size: 15px; font-weight: 700; }")
+        right_layout.addWidget(self.tabs, 1)
+
+        self.body_layout.addWidget(self.left_panel, 3)
+        self.body_layout.addWidget(self.right_panel, 2)
 
         tab_scan = QWidget()
         scan_layout = QVBoxLayout(tab_scan)
         scan_layout.setContentsMargins(4, 4, 4, 4)
         scan_layout.setSpacing(6)
 
-        buttons1 = QHBoxLayout()
+        self.scan_buttons1 = QBoxLayout(QBoxLayout.LeftToRight)
         self.btn_roi = QPushButton("Set ROI")
         self.btn_auto_roi = QPushButton("Auto ROI")
         self.btn_clear_roi = QPushButton("Clear ROI")
-        buttons1.addWidget(self.btn_roi)
-        buttons1.addWidget(self.btn_auto_roi)
-        buttons1.addWidget(self.btn_clear_roi)
-        scan_layout.addLayout(buttons1)
+        self.scan_buttons1.addWidget(self.btn_roi)
+        self.scan_buttons1.addWidget(self.btn_auto_roi)
+        self.scan_buttons1.addWidget(self.btn_clear_roi)
+        scan_layout.addLayout(self.scan_buttons1)
 
-        buttons2 = QHBoxLayout()
+        self.scan_buttons2 = QBoxLayout(QBoxLayout.LeftToRight)
         self.btn_capture = QPushButton("Capture + Analyze")
         self.btn_export = QPushButton("Export CSV")
-        buttons2.addWidget(self.btn_capture, 2)
-        buttons2.addWidget(self.btn_export, 1)
-        scan_layout.addLayout(buttons2)
+        self.scan_buttons2.addWidget(self.btn_capture, 2)
+        self.scan_buttons2.addWidget(self.btn_export, 1)
+        scan_layout.addLayout(self.scan_buttons2)
 
         self.result = QTextEdit()
         self.result.setReadOnly(True)
@@ -296,9 +317,9 @@ class MainWindow(QMainWindow):
         scan_layout.addWidget(self.result)
 
         tab_session = QWidget()
-        sess_form = QFormLayout(tab_session)
-        sess_form.setContentsMargins(8, 8, 8, 8)
-        sess_form.setSpacing(6)
+        self.sess_form = QFormLayout(tab_session)
+        self.sess_form.setContentsMargins(8, 8, 8, 8)
+        self.sess_form.setSpacing(6)
         self.in_vehicle = QLineEdit()
         self.in_vehicle.setPlaceholderText("Vehicle ID")
         self.in_tire = QComboBox()
@@ -313,13 +334,13 @@ class MainWindow(QMainWindow):
         self.in_psi_recommended.setPlaceholderText("Recommended PSI (e.g., 32.0)")
         self.psi_status = QLabel("PSI Status: -")
         self.psi_status.setStyleSheet("color:#9fd9ff; font-size:14px; font-weight:700;")
-        sess_form.addRow("Vehicle", self.in_vehicle)
-        sess_form.addRow("Tire", self.in_tire)
-        sess_form.addRow("Operator", self.in_operator)
-        sess_form.addRow("PSI Measured", self.in_psi_measured)
-        sess_form.addRow("PSI Recommended", self.in_psi_recommended)
-        sess_form.addRow("PSI Status", self.psi_status)
-        sess_form.addRow("Notes", self.in_notes)
+        self.sess_form.addRow("Vehicle", self.in_vehicle)
+        self.sess_form.addRow("Tire", self.in_tire)
+        self.sess_form.addRow("Operator", self.in_operator)
+        self.sess_form.addRow("PSI Measured", self.in_psi_measured)
+        self.sess_form.addRow("PSI Recommended", self.in_psi_recommended)
+        self.sess_form.addRow("PSI Status", self.psi_status)
+        self.sess_form.addRow("Notes", self.in_notes)
         self.in_psi_measured.textChanged.connect(self._update_psi_status_label)
         self.in_psi_recommended.textChanged.connect(self._update_psi_status_label)
 
@@ -361,10 +382,10 @@ class MainWindow(QMainWindow):
         set_layout.addRow("Warn ±", self.psi_warn_input)
         set_layout.addRow(self.btn_open_cam)
 
-        tabs.addTab(self._wrap_tab_scroll(tab_scan), "Scan")
-        tabs.addTab(self._wrap_tab_scroll(tab_session), "Session")
-        tabs.addTab(self._wrap_tab_scroll(tab_history), "History")
-        tabs.addTab(self._wrap_tab_scroll(tab_settings), "Settings")
+        self.tabs.addTab(self._wrap_tab_scroll(tab_scan), "Scan")
+        self.tabs.addTab(self._wrap_tab_scroll(tab_session), "Session")
+        self.tabs.addTab(self._wrap_tab_scroll(tab_history), "History")
+        self.tabs.addTab(self._wrap_tab_scroll(tab_settings), "Settings")
 
         self.btn_roi.clicked.connect(self._toggle_roi_mode)
         self.btn_auto_roi.clicked.connect(self._auto_roi)
@@ -378,6 +399,7 @@ class MainWindow(QMainWindow):
         self._update_psi_status_label()
         self._refresh_history()
         self._sync_fullscreen_button()
+        self._apply_layout_mode()
 
     def _wrap_tab_scroll(self, page: QWidget) -> QScrollArea:
         scroll = QScrollArea()
@@ -409,6 +431,71 @@ class MainWindow(QMainWindow):
             self.showFullScreen()
             self._set_status("Fullscreen mode")
         self._sync_fullscreen_button()
+        self._apply_layout_mode()
+
+    def _apply_layout_mode(self):
+        if not hasattr(self, "body_layout") or not hasattr(self, "tabs"):
+            return
+        if self.isFullScreen():
+            # Fullscreen keeps the existing stacked composition.
+            self.body_layout.setDirection(QBoxLayout.TopToBottom)
+            self.body_layout.setStretch(0, 3)
+            self.body_layout.setStretch(1, 2)
+            self.tabs.setTabPosition(QTabWidget.North)
+            self.tabs.setStyleSheet(
+                "QTabBar::tab { min-height: 32px; min-width: 110px; font-size: 15px; font-weight: 700; }"
+            )
+            if hasattr(self, "scan_buttons1"):
+                self.scan_buttons1.setDirection(QBoxLayout.LeftToRight)
+            if hasattr(self, "scan_buttons2"):
+                self.scan_buttons2.setDirection(QBoxLayout.LeftToRight)
+            if hasattr(self, "sess_form"):
+                self.sess_form.setRowWrapPolicy(QFormLayout.DontWrapRows)
+            for btn in (self.btn_roi, self.btn_auto_roi, self.btn_clear_roi, self.btn_capture, self.btn_export):
+                btn.setStyleSheet("")
+            for w in (
+                self.in_vehicle,
+                self.in_operator,
+                self.in_notes,
+                self.in_psi_measured,
+                self.in_psi_recommended,
+                self.in_tire,
+            ):
+                w.setStyleSheet("")
+            self.result.setMinimumHeight(88)
+            self.result.setMaximumHeight(120)
+        else:
+            # Windowed 800x480: camera on left, entire tab section on right.
+            self.body_layout.setDirection(QBoxLayout.LeftToRight)
+            self.body_layout.setStretch(0, 4)
+            self.body_layout.setStretch(1, 5)
+            self.tabs.setTabPosition(QTabWidget.North)
+            self.tabs.setStyleSheet(
+                "QTabBar::tab { min-height: 30px; min-width: 84px; font-size: 14px; font-weight: 700; }"
+            )
+            if hasattr(self, "scan_buttons1"):
+                self.scan_buttons1.setDirection(QBoxLayout.TopToBottom)
+            if hasattr(self, "scan_buttons2"):
+                self.scan_buttons2.setDirection(QBoxLayout.TopToBottom)
+            if hasattr(self, "sess_form"):
+                self.sess_form.setRowWrapPolicy(QFormLayout.WrapAllRows)
+            compact_btn_style = "QPushButton { min-height: 40px; font-size: 13px; padding: 4px 8px; border-radius: 8px; }"
+            for btn in (self.btn_roi, self.btn_auto_roi, self.btn_clear_roi, self.btn_capture, self.btn_export):
+                btn.setStyleSheet(compact_btn_style)
+            compact_input_style = (
+                "QLineEdit, QComboBox { min-height: 30px; font-size: 13px; padding: 4px; border-radius: 7px; }"
+            )
+            for w in (
+                self.in_vehicle,
+                self.in_operator,
+                self.in_notes,
+                self.in_psi_measured,
+                self.in_psi_recommended,
+                self.in_tire,
+            ):
+                w.setStyleSheet(compact_input_style)
+            self.result.setMinimumHeight(66)
+            self.result.setMaximumHeight(96)
 
     def _update_roi_info(self):
         if not self.roi:
@@ -705,4 +792,5 @@ def run_app(cfg):
     else:
         w.show()  # Fixed 800x480 locked in __init__
     w._sync_fullscreen_button()
+    w._apply_layout_mode()
     sys.exit(app.exec())
