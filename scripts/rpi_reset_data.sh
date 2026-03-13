@@ -3,21 +3,31 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="${ROOT_DIR}/.venv"
+VENV_PYTHON="${VENV_DIR}/bin/python"
+AUTO_SETUP="${TIREGUARD_AUTO_SETUP:-0}"
 
 if [[ ! -d "${VENV_DIR}" ]]; then
-  echo "Error: virtual environment not found at ${VENV_DIR}."
-  echo "Run setup first: ./scripts/rpi_setup.sh"
-  exit 1
+    if [[ "${AUTO_SETUP}" == "1" ]]; then
+        echo "Virtual environment missing. Running setup..."
+        "${ROOT_DIR}/scripts/rpi_setup.sh"
+    else
+        echo "Error: virtual environment not found at ${VENV_DIR}."
+        echo "Run setup first: ./scripts/rpi_setup.sh"
+        echo "Or set TIREGUARD_AUTO_SETUP=1 to bootstrap automatically."
+        exit 1
+    fi
 fi
 
-# shellcheck disable=SC1091
-source "${VENV_DIR}/bin/activate"
+if [[ ! -x "${VENV_PYTHON}" ]]; then
+    echo "Error: Python not found in virtual environment: ${VENV_PYTHON}"
+    exit 1
+fi
 
 cd "${ROOT_DIR}"
 
 echo "Resetting TireGuard dataset while keeping DB file/schema..."
 
-python - <<'PY'
+"${VENV_PYTHON}" - <<'PY'
 from pathlib import Path
 import sqlite3
 

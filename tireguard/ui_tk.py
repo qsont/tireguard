@@ -10,12 +10,24 @@ from .preprocess import preprocess_bgr, crop_roi
 from .quality import run_quality_checks
 from .measure import groove_visibility_score, pass_fail_from_score
 from .auto_roi import suggest_roi
-from .calibration import load_calibration, save_calibration, compute_scale_from_two_points
+from .calibration import load_calibration, save_calibration, compute_scale_from_two_points, score_to_depth_mm
 from .storage import (
     init_db, save_capture, save_processed, insert_result,
-    export_csv, list_results, get_result_by_ts, find_processed_images
+    export_csv, list_results, get_result_by_ts, find_processed_images,
+    hard_delete_scan_by_ts, restore_scan_by_ts, soft_delete_scan_by_ts
 )
 from .config import APP_NAME, AppConfig, RES_PRESETS
+
+
+LEGAL_MIN_DEPTH_MM = {
+    "car": 1.6,
+    "motorcycle": 1.0,
+}
+
+DEFAULT_WARNING_BAND_MM = {
+    "car": 0.4,
+    "motorcycle": 0.4,
+}
 
 def list_camera_indices(max_idx=6):
     # basic probing
@@ -52,6 +64,8 @@ class TireGuardApp(tk.Tk):
         # calibration click state
         self.calib_mode = False
         self._calib_points = []  # two points in display coords
+        self._last_scan_depth_mm = None
+        self._last_scan_vehicle_type = "Car"
 
         self._build_ui()
         self._open_camera()
@@ -114,21 +128,31 @@ class TireGuardApp(tk.Tk):
         sess.columnconfigure(1, weight=1)
 
         self.vehicle_var = tk.StringVar(value="")
+        self.vehicle_type_var = tk.StringVar(value="Car")
         self.tirepos_var = tk.StringVar(value="FR")
         self.operator_var = tk.StringVar(value="")
         self.snotes_var = tk.StringVar(value="")
 
-        ttk.Label(sess, text="Vehicle ID").grid(row=0, column=0, sticky="w", padx=6, pady=2)
-        ttk.Entry(sess, textvariable=self.vehicle_var).grid(row=0, column=1, sticky="ew", padx=6, pady=2)
+        self.car_warn_band_var = tk.StringVar(value=str(getattr(self.cfg, "car_warning_band_mm", DEFAULT_WARNING_BAND_MM["car"])))
+        self.moto_warn_band_var = tk.StringVar(value=str(getattr(self.cfg, "motorcycle_warning_band_mm", DEFAULT_WARNING_BAND_MM["motorcycle"])))
 
-        ttk.Label(sess, text="Tire").grid(row=1, column=0, sticky="w", padx=6, pady=2)
-        ttk.Combobox(sess, textvariable=self.tirepos_var, values=["FL","FR","RL","RR","SPARE"], state="readonly").grid(row=1, column=1, sticky="ew", padx=6, pady=2)
+        self.vehicle_type_var.trace_add("write", lambda *_: self._on_vehicle_type_changed())
 
-        ttk.Label(sess, text="Operator").grid(row=2, column=0, sticky="w", padx=6, pady=2)
-        ttk.Entry(sess, textvariable=self.operator_var).grid(row=2, column=1, sticky="ew", padx=6, pady=2)
+        ttk.Label(sess, text="Vehicle Type").grid(row=0, column=0, sticky="w", padx=6, pady=2)
+        ttk.Combobox(sess, textvariable=self.vehicle_type_var, values=["Car", "Motorcycle"], state="readonly").grid(row=0, column=1, sticky="ew", padx=6, pady=2)
 
-        ttk.Label(sess, text="Notes").grid(row=3, column=0, sticky="w", padx=6, pady=2)
-        ttk.Entry(sess, textvariable=self.snotes_var).grid(row=3, column=1, sticky="ew", padx=6, pady=2)
+        ttk.Label(sess, text="Vehicle ID").grid(row=1, column=0, sticky="w", padx=6, pady=2)
+        ttk.Entry(sess, textvariable=self.vehicle_var).grid(row=1, column=1, sticky="ew", padx=6, pady=2)
+
+        ttk.Label(sess, text="Tire").grid(row=2, column=0, sticky="w", padx=6, pady=2)
+        self.tire_combo = ttk.Combobox(sess, textvariable=self.tirepos_var, values=["FL","FR","RL","RR","SPARE"], state="readonly")
+        self.tire_combo.grid(row=2, column=1, sticky="ew", padx=6, pady=2)
+
+        ttk.Label(sess, text="Operator").grid(row=3, column=0, sticky="w", padx=6, pady=2)
+        ttk.Entry(sess, textvariable=self.operator_var).grid(row=3, column=1, sticky="ew", padx=6, pady=2)
+
+        ttk.Label(sess, text="Notes").grid(row=4, column=0, sticky="w", padx=6, pady=2)
+        ttk.Entry(sess, textvariable=self.snotes_var).grid(row=4, column=1, sticky="ew", padx=6, pady=2)
 
         # --- ROI + Calibration ---
         actions = ttk.Frame(right)
@@ -149,18 +173,30 @@ class TireGuardApp(tk.Tk):
         ttk.Label(calib_box, textvariable=self.calib_lbl, wraplength=360).grid(row=0, column=0, columnspan=2, sticky="ew", padx=6, pady=4)
         ttk.Button(calib_box, text="Start 2-point calibration", command=self._start_calibration).grid(row=1, column=0, sticky="ew", padx=6, pady=4)
         ttk.Button(calib_box, text="Clear calibration", command=self._clear_calibration).grid(row=1, column=1, sticky="ew", padx=6, pady=4)
+        ttk.Label(calib_box, text="Car warning band (mm)").grid(row=2, column=0, sticky="w", padx=6, pady=2)
+        ttk.Entry(calib_box, textvariable=self.car_warn_band_var).grid(row=2, column=1, sticky="ew", padx=6, pady=2)
+        ttk.Label(calib_box, text="Motorcycle warning band (mm)").grid(row=3, column=0, sticky="w", padx=6, pady=2)
+        ttk.Entry(calib_box, textvariable=self.moto_warn_band_var).grid(row=3, column=1, sticky="ew", padx=6, pady=2)
+        ttk.Button(calib_box, text="Save Depth Policy", command=self._save_depth_policy).grid(row=4, column=0, columnspan=2, sticky="ew", padx=6, pady=4)
 
-        ttk.Separator(right).grid(row=7, column=0, sticky="ew", pady=8)
+        self.depth_policy_text = tk.Text(right, height=7, width=46)
+        self.depth_policy_text.grid(row=7, column=0, sticky="nsew", pady=4)
+        self.depth_policy_text.configure(state="disabled")
+        self.depth_policy_text.tag_configure("chip_replace", background="#c0392b", foreground="white")
+        self.depth_policy_text.tag_configure("chip_warning", background="#e67e22", foreground="white")
+        self.depth_policy_text.tag_configure("chip_good", background="#27ae60", foreground="white")
+
+        ttk.Separator(right).grid(row=8, column=0, sticky="ew", pady=8)
 
         # Capture controls
-        ttk.Button(right, text="Capture + Analyze", command=self._capture_analyze).grid(row=8, column=0, sticky="ew", pady=2)
-        ttk.Button(right, text="Export CSV", command=self._export_csv).grid(row=9, column=0, sticky="ew", pady=2)
+        ttk.Button(right, text="Capture + Analyze", command=self._capture_analyze).grid(row=9, column=0, sticky="ew", pady=2)
+        ttk.Button(right, text="Export CSV", command=self._export_csv).grid(row=10, column=0, sticky="ew", pady=2)
 
-        ttk.Separator(right).grid(row=10, column=0, sticky="ew", pady=8)
+        ttk.Separator(right).grid(row=11, column=0, sticky="ew", pady=8)
 
-        ttk.Label(right, text="Processed Preview", font=("Arial", 12, "bold")).grid(row=11, column=0, sticky="w")
+        ttk.Label(right, text="Processed Preview", font=("Arial", 12, "bold")).grid(row=12, column=0, sticky="w")
         prev = ttk.Frame(right)
-        prev.grid(row=12, column=0, sticky="ew")
+        prev.grid(row=13, column=0, sticky="ew")
         prev.columnconfigure(0, weight=1)
         prev.columnconfigure(1, weight=1)
 
@@ -170,20 +206,45 @@ class TireGuardApp(tk.Tk):
         self.edges_label = tk.Label(prev, text="edges", bg="#222", fg="white")
         self.edges_label.grid(row=0, column=1, sticky="nsew", padx=3, pady=3)
 
-        ttk.Separator(right).grid(row=13, column=0, sticky="ew", pady=8)
+        ttk.Separator(right).grid(row=14, column=0, sticky="ew", pady=8)
 
-        ttk.Label(right, text="Last Result", font=("Arial", 12, "bold")).grid(row=14, column=0, sticky="w")
+        ttk.Label(right, text="Last Result", font=("Arial", 12, "bold")).grid(row=15, column=0, sticky="w")
         self.result_text = tk.Text(right, height=10, width=46)
-        self.result_text.grid(row=15, column=0, sticky="nsew", pady=4)
-        right.rowconfigure(15, weight=1)
+        self.result_text.grid(row=16, column=0, sticky="nsew", pady=4)
+        right.rowconfigure(16, weight=1)
 
-        ttk.Label(right, text="History (click to load)", font=("Arial", 11, "bold")).grid(row=16, column=0, sticky="w")
+        ttk.Label(right, text="History (click to load)", font=("Arial", 11, "bold")).grid(row=17, column=0, sticky="w")
+        history_controls = ttk.Frame(right)
+        history_controls.grid(row=18, column=0, sticky="ew", pady=(2, 0))
+        history_controls.columnconfigure(0, weight=1)
+        self.history_mode_var = tk.StringVar(value="Active")
+        self.history_mode_combo = ttk.Combobox(
+            history_controls,
+            textvariable=self.history_mode_var,
+            values=["Active", "Recycle Bin"],
+            state="readonly",
+            width=14,
+        )
+        self.history_mode_combo.grid(row=0, column=0, sticky="w", padx=(0, 4))
+        self.history_mode_combo.bind("<<ComboboxSelected>>", self._on_history_mode_changed)
+        self.btn_hist_delete = ttk.Button(history_controls, text="Delete", command=self._delete_selected_history_scan)
+        self.btn_hist_delete.grid(row=0, column=1, padx=2)
+        self.btn_hist_restore = ttk.Button(history_controls, text="Restore", command=self._restore_selected_history_scan)
+        self.btn_hist_restore.grid(row=0, column=2, padx=2)
+        self.btn_hist_hard_delete = ttk.Button(history_controls, text="Hard Delete", command=self._hard_delete_selected_history_scan)
+        self.btn_hist_hard_delete.grid(row=0, column=3, padx=2)
+        self.btn_hist_refresh = ttk.Button(history_controls, text="Refresh", command=self._refresh_history)
+        self.btn_hist_refresh.grid(row=0, column=4, padx=(6, 0))
         self.history = tk.Listbox(right, height=7)
-        self.history.grid(row=17, column=0, sticky="nsew", pady=4)
+        self.history.grid(row=19, column=0, sticky="nsew", pady=4)
         self.history.bind("<<ListboxSelect>>", self._on_history_select)
+        right.rowconfigure(19, weight=1)
 
         self._load_roi()
         self._refresh_camera_list()
+        self._on_vehicle_type_changed()
+        self._refresh_depth_policy_info()
+        self._update_history_action_buttons()
 
     def _calib_text(self):
         if self.calib.get("mm_per_px"):
@@ -284,6 +345,95 @@ class TireGuardApp(tk.Tk):
         save_calibration(self.cfg.calibration_path, self.calib)
         self.calib_lbl.set(self._calib_text())
         self.status_var.set("Status: calibration cleared")
+
+    def _save_depth_policy(self):
+        try:
+            self.cfg.car_warning_band_mm = max(0.0, float(self.car_warn_band_var.get().strip()))
+            self.cfg.motorcycle_warning_band_mm = max(0.0, float(self.moto_warn_band_var.get().strip()))
+            self.cfg.save_runtime_settings()
+            self._refresh_depth_policy_info()
+            self.status_var.set("Status: depth policy saved")
+        except Exception as e:
+            self.status_var.set(f"Status: depth policy save failed ({e})")
+
+    def _on_vehicle_type_changed(self):
+        vt = (self.vehicle_type_var.get() or "Car").strip().lower()
+        if vt == "motorcycle":
+            values = ["F (Front)", "R (Rear)"]
+            if self.tirepos_var.get() not in values:
+                self.tirepos_var.set(values[0])
+        else:
+            values = ["FL", "FR", "RL", "RR", "SPARE"]
+            if self.tirepos_var.get() not in values:
+                self.tirepos_var.set(values[0])
+        if hasattr(self, "tire_combo"):
+            self.tire_combo["values"] = values
+        self._refresh_depth_policy_info()
+
+    def _legal_min_depth_mm(self, vehicle_type: str) -> float:
+        vt = (vehicle_type or "car").strip().lower()
+        if vt == "motorcycle":
+            return float(getattr(self.cfg, "motorcycle_legal_min_depth_mm", LEGAL_MIN_DEPTH_MM["motorcycle"]))
+        return float(getattr(self.cfg, "car_legal_min_depth_mm", LEGAL_MIN_DEPTH_MM["car"]))
+
+    def _warning_band_mm(self, vehicle_type: str) -> float:
+        vt = (vehicle_type or "car").strip().lower()
+        try:
+            self.cfg.car_warning_band_mm = max(0.0, float(self.car_warn_band_var.get().strip()))
+            self.cfg.motorcycle_warning_band_mm = max(0.0, float(self.moto_warn_band_var.get().strip()))
+        except Exception:
+            pass
+        if vt == "motorcycle":
+            return float(getattr(self.cfg, "motorcycle_warning_band_mm", DEFAULT_WARNING_BAND_MM["motorcycle"]))
+        return float(getattr(self.cfg, "car_warning_band_mm", DEFAULT_WARNING_BAND_MM["car"]))
+
+    def _tread_verdict_from_depth(self, depth_mm: float, vehicle_type: str) -> str:
+        min_mm = self._legal_min_depth_mm(vehicle_type)
+        warn_band = max(0.0, self._warning_band_mm(vehicle_type))
+        if depth_mm < min_mm:
+            return "REPLACE"
+        if depth_mm < (min_mm + warn_band):
+            return "WARNING"
+        return "GOOD"
+
+    def _refresh_depth_policy_info(self):
+        if not hasattr(self, "depth_policy_text"):
+            return
+        vt = (self.vehicle_type_var.get() or "Car").strip()
+        min_mm = self._legal_min_depth_mm(vt)
+        warn_band = self._warning_band_mm(vt)
+        good_threshold = min_mm + warn_band
+
+        self.depth_policy_text.configure(state="normal")
+        self.depth_policy_text.delete("1.0", tk.END)
+
+        if vt.lower() == "motorcycle":
+            self.depth_policy_text.insert(tk.END, "Industry Ref: Legal min 1.0 mm (jurisdiction-dependent)\n")
+            guidance = "New: ~4-7 mm   Near-limit: ~1.0-1.5 mm"
+        else:
+            self.depth_policy_text.insert(tk.END, "Industry Ref: DOT/US/EU car legal minimum: 1.6 mm\n")
+            guidance = "New: ~7-8 mm   Good: ~4-6 mm   Worn: ~2-4 mm"
+
+        self.depth_policy_text.insert(tk.END,
+            f"Policy: min {min_mm:.1f} mm, band +{warn_band:.1f} mm\n")
+        self.depth_policy_text.insert(tk.END, " ")
+        self.depth_policy_text.insert(tk.END, "REPLACE", "chip_replace")
+        self.depth_policy_text.insert(tk.END, f" <{min_mm:.1f}   ")
+        self.depth_policy_text.insert(tk.END, "WARNING", "chip_warning")
+        self.depth_policy_text.insert(tk.END, f" {min_mm:.1f}-{good_threshold:.1f}   ")
+        self.depth_policy_text.insert(tk.END, "GOOD", "chip_good")
+        self.depth_policy_text.insert(tk.END, f" \u2265{good_threshold:.1f} mm\n")
+        self.depth_policy_text.insert(tk.END, guidance + "\n")
+
+        if self._last_scan_depth_mm is not None:
+            last_vt = self._last_scan_vehicle_type or vt
+            last_v = self._tread_verdict_from_depth(self._last_scan_depth_mm, last_vt)
+            tag = {"REPLACE": "chip_replace", "WARNING": "chip_warning", "GOOD": "chip_good"}.get(last_v, "chip_good")
+            self.depth_policy_text.insert(tk.END, "Last Scan: ")
+            self.depth_policy_text.insert(tk.END, last_v, tag)
+            self.depth_policy_text.insert(tk.END, f"  {self._last_scan_depth_mm:.3f} mm\n")
+
+        self.depth_policy_text.configure(state="disabled")
 
     def _on_mouse_down(self, event):
         if self.calib_mode:
@@ -413,7 +563,11 @@ class TireGuardApp(tk.Tk):
         processed = preprocess_bgr(roi_bgr, clahe_clip=self.cfg.clahe_clip, clahe_grid=self.cfg.clahe_grid)
         q = run_quality_checks(processed["gray"], self.cfg)
         m = groove_visibility_score(processed["edges_closed"])
-        verdict = pass_fail_from_score(m["score"])
+        raw_score_verdict = pass_fail_from_score(m["score"])
+        device_depth = score_to_depth_mm(float(m["score"]), calib=self.calib)
+        vehicle_type = self.vehicle_type_var.get().strip() or "Car"
+        tread_verdict = self._tread_verdict_from_depth(device_depth, vehicle_type)
+        verdict = tread_verdict
 
         mm_per_px = self.calib.get("mm_per_px")
 
@@ -423,7 +577,9 @@ class TireGuardApp(tk.Tk):
             "quality": q,
             "measure": m,
             "verdict": verdict,
+            "tread_verdict": tread_verdict,
             "session": {
+                "vehicle_type": vehicle_type,
                 "vehicle_id": self.vehicle_var.get().strip() or None,
                 "tire_position": self.tirepos_var.get().strip() or None,
                 "operator": self.operator_var.get().strip() or None,
@@ -446,8 +602,12 @@ class TireGuardApp(tk.Tk):
             "edge_density": float(m["edge_density"]),
             "continuity": float(m["continuity"]),
             "score": float(m["score"]),
+            "device_depth_mm": float(device_depth),
+            "raw_score_verdict": raw_score_verdict,
             "verdict": verdict,
+            "tread_verdict": tread_verdict,
             "notes": "; ".join(q["reasons"]) if not q["ok"] else "",
+            "vehicle_type": vehicle_type,
             "vehicle_id": self.vehicle_var.get().strip() or None,
             "tire_position": self.tirepos_var.get().strip() or None,
             "operator": self.operator_var.get().strip() or None,
@@ -471,24 +631,35 @@ class TireGuardApp(tk.Tk):
         if q["reasons"]:
             for r in q["reasons"]:
                 self.result_text.insert(tk.END, f" - {r}\n")
-        self.result_text.insert(tk.END, f"\nScore: {m['score']:.4f}\nVERDICT: {verdict}\n")
+        self.result_text.insert(tk.END, f"\nScore: {m['score']:.4f}\n")
+        self.result_text.insert(tk.END, f"Depth (calibrated): {device_depth:.3f} mm\n")
+        self.result_text.insert(tk.END, f"Raw Score Verdict: {raw_score_verdict}\n")
+        self.result_text.insert(tk.END, f"Tread Verdict: {tread_verdict}\nVERDICT: {verdict}\n")
 
+        self._last_scan_depth_mm = device_depth
+        self._last_scan_vehicle_type = vehicle_type
+        self._refresh_depth_policy_info()
         self.status_var.set(f"Status: captured + analyzed ({verdict})")
         self._refresh_history()
 
     def _refresh_history(self):
         self.history.delete(0, tk.END)
-        items = list_results(self.cfg, limit=30)
+        only_deleted = getattr(self, "history_mode_var", None) is not None and self.history_mode_var.get() == "Recycle Bin"
+        items = list_results(self.cfg, limit=30, only_deleted=only_deleted)
         for it in items:
             self.history.insert(tk.END, f"{it['ts']} | {it['verdict']} | {it['score']:.4f}")
+        self._update_history_action_buttons()
 
     def _on_history_select(self, event):
         if not self.history.curselection():
+            self._update_history_action_buttons()
             return
         line = self.history.get(self.history.curselection()[0])
         ts = line.split("|")[0].strip()
-        row = get_result_by_ts(self.cfg, ts)
+        only_deleted = getattr(self, "history_mode_var", None) is not None and self.history_mode_var.get() == "Recycle Bin"
+        row = get_result_by_ts(self.cfg, ts, include_deleted=only_deleted)
         if not row:
+            self._update_history_action_buttons()
             return
 
         imgs = find_processed_images(self.cfg, ts)
@@ -502,9 +673,68 @@ class TireGuardApp(tk.Tk):
         self.result_text.insert(tk.END, f"Session: vehicle={row.get('vehicle_id')} tire={row.get('tire_position')} operator={row.get('operator')}\n")
         if row.get("mm_per_px"):
             self.result_text.insert(tk.END, f"Calibration: {row['mm_per_px']:.6f} mm/px\n")
+        if row.get("device_depth_mm") is not None:
+            self.result_text.insert(tk.END, f"Depth (calibrated): {float(row['device_depth_mm']):.3f} mm\n")
+        if row.get("raw_score_verdict"):
+            self.result_text.insert(tk.END, f"Raw Score Verdict: {row['raw_score_verdict']}\n")
         self.result_text.insert(tk.END, f"\nScore: {row['score']:.4f}\nVERDICT: {row['verdict']}\n")
         if row.get("session_notes"):
             self.result_text.insert(tk.END, f"\nNotes: {row['session_notes']}\n")
+        self._update_history_action_buttons()
+
+    def _selected_history_ts(self):
+        if not self.history.curselection():
+            return None
+        line = self.history.get(self.history.curselection()[0])
+        return line.split("|")[0].strip()
+
+    def _on_history_mode_changed(self, _event=None):
+        self.result_text.delete("1.0", tk.END)
+        self._refresh_history()
+
+    def _update_history_action_buttons(self):
+        in_recycle = getattr(self, "history_mode_var", None) is not None and self.history_mode_var.get() == "Recycle Bin"
+        has_sel = self._selected_history_ts() is not None
+        if hasattr(self, "btn_hist_delete"):
+            self.btn_hist_delete.state(["!disabled"] if (has_sel and not in_recycle) else ["disabled"])
+        if hasattr(self, "btn_hist_restore"):
+            self.btn_hist_restore.state(["!disabled"] if (has_sel and in_recycle) else ["disabled"])
+        if hasattr(self, "btn_hist_hard_delete"):
+            self.btn_hist_hard_delete.state(["!disabled"] if (has_sel and in_recycle) else ["disabled"])
+
+    def _delete_selected_history_scan(self):
+        ts = self._selected_history_ts()
+        if not ts:
+            return
+        if not messagebox.askyesno("Delete Scan", f"Move scan {ts} to recycle bin?"):
+            return
+        out = soft_delete_scan_by_ts(self.cfg, ts)
+        if out.get("deleted", 0):
+            self.result_text.delete("1.0", tk.END)
+            self.status_var.set(f"Status: moved {ts} to recycle bin")
+            self._refresh_history()
+
+    def _restore_selected_history_scan(self):
+        ts = self._selected_history_ts()
+        if not ts:
+            return
+        out = restore_scan_by_ts(self.cfg, ts)
+        if out.get("restored", 0):
+            self.result_text.delete("1.0", tk.END)
+            self.status_var.set(f"Status: restored {ts}")
+            self._refresh_history()
+
+    def _hard_delete_selected_history_scan(self):
+        ts = self._selected_history_ts()
+        if not ts:
+            return
+        if not messagebox.askyesno("Hard Delete Scan", f"Permanently delete scan {ts} and its files?"):
+            return
+        out = hard_delete_scan_by_ts(self.cfg, ts, delete_files=True)
+        if out.get("deleted", 0):
+            self.result_text.delete("1.0", tk.END)
+            self.status_var.set(f"Status: hard deleted {ts}")
+            self._refresh_history()
 
     def _export_csv(self):
         p = export_csv(self.cfg)

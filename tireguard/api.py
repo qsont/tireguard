@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, HTTPException, Query, Form
+from fastapi import FastAPI, HTTPException, Query, Form, Body
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 import uvicorn
@@ -19,11 +19,56 @@ except Exception:
     load_config = None  # type: ignore
 
 from .config import AppConfig
+from .calibration import load_calibration, score_to_depth_mm
 from .storage import (
     init_db,  # added
     list_results, get_result_by_ts, export_csv, find_processed_images,
-    list_validation_results, export_validation_summary
+  list_validation_results, export_validation_summary,
+  soft_delete_scan_by_ts, soft_delete_scans_by_ts,
+  restore_scan_by_ts, restore_scans_by_ts,
+  hard_delete_scan_by_ts, hard_delete_scans_by_ts,
+  soft_delete_validation_by_id, restore_validation_by_id, hard_delete_validation_by_id,
+  soft_delete_all_data, purge_data,
 )
+
+
+LEGAL_MIN_DEPTH_MM = {
+  "car": 1.6,
+  "motorcycle": 1.0,
+}
+
+DEFAULT_WARNING_BAND_MM = {
+  "car": 0.4,
+  "motorcycle": 0.4,
+}
+
+
+def _legal_min_depth_mm(cfg: AppConfig, vehicle_type: str | None) -> float:
+  v = (vehicle_type or "car").strip().lower()
+  if v == "car":
+    return float(getattr(cfg, "car_legal_min_depth_mm", LEGAL_MIN_DEPTH_MM["car"]))
+  if v == "motorcycle":
+    return float(getattr(cfg, "motorcycle_legal_min_depth_mm", LEGAL_MIN_DEPTH_MM["motorcycle"]))
+  return LEGAL_MIN_DEPTH_MM.get(v, LEGAL_MIN_DEPTH_MM["car"])
+
+
+def _warning_band_mm(cfg: AppConfig, vehicle_type: str | None) -> float:
+  v = (vehicle_type or "car").strip().lower()
+  if v == "car":
+    return float(getattr(cfg, "car_warning_band_mm", DEFAULT_WARNING_BAND_MM["car"]))
+  if v == "motorcycle":
+    return float(getattr(cfg, "motorcycle_warning_band_mm", DEFAULT_WARNING_BAND_MM["motorcycle"]))
+  return DEFAULT_WARNING_BAND_MM["car"]
+
+
+def _tread_verdict_from_depth(cfg: AppConfig, depth_mm: float, vehicle_type: str | None) -> str:
+  min_mm = _legal_min_depth_mm(cfg, vehicle_type)
+  warn_band = max(0.0, _warning_band_mm(cfg, vehicle_type))
+  if depth_mm < min_mm:
+    return "REPLACE"
+  if depth_mm < (min_mm + warn_band):
+    return "WARNING"
+  return "GOOD"
 
 
 def _cfg():
@@ -83,6 +128,8 @@ def scans(
     tire_type: str | None = None,
     tread_design: str | None = None,
     tire_model_code: str | None = None,
+    include_deleted: bool = Query(False),
+    only_deleted: bool = Query(False),
 ):
     """List recent scan results with filtering support."""
     cfg = _cfg()
@@ -96,18 +143,89 @@ def scans(
         tire_type=tire_type,
         tread_design=tread_design,
         tire_model_code=tire_model_code,
+        include_deleted=include_deleted,
+        only_deleted=only_deleted,
     )
-    return _jsonify({"items": rows, "limit": limit})
+    return _jsonify({"items": rows, "limit": limit, "include_deleted": include_deleted, "only_deleted": only_deleted})
 
 
 @app.get("/api/scans/{ts}")
-def scan_detail(ts: str):
+def scan_detail(ts: str, include_deleted: bool = Query(False)):
     """Get detailed information for a specific scan by timestamp."""
     cfg = _cfg()
-    row = get_result_by_ts(cfg, ts)
+    row = get_result_by_ts(cfg, ts, include_deleted=include_deleted)
     if not row:
         raise HTTPException(status_code=404, detail="Scan not found")
     return _jsonify(row)
+
+
+@app.delete("/api/scans/{ts}")
+def delete_scan(ts: str):
+    """Move one scan row to recycle bin."""
+    cfg = _cfg()
+    out = soft_delete_scan_by_ts(cfg, ts)
+    if out.get("deleted", 0) == 0:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    return _jsonify({"ok": True, "ts": ts, **out})
+
+
+@app.post("/api/scans/{ts}/restore")
+def restore_scan(ts: str):
+    cfg = _cfg()
+    out = restore_scan_by_ts(cfg, ts)
+    if out.get("restored", 0) == 0:
+        raise HTTPException(status_code=404, detail="Scan not found in recycle bin")
+    return _jsonify({"ok": True, "ts": ts, **out})
+
+
+@app.delete("/api/scans/{ts}/hard")
+def hard_delete_scan(ts: str, delete_files: bool = Query(True)):
+    cfg = _cfg()
+    out = hard_delete_scan_by_ts(cfg, ts, delete_files=delete_files)
+    if out.get("deleted", 0) == 0:
+        raise HTTPException(status_code=404, detail="Scan not found")
+    return _jsonify({"ok": True, "ts": ts, **out})
+
+
+@app.post("/api/scans/delete-batch")
+def delete_scan_batch(payload: dict = Body(...)):
+    """Batch soft-delete scans by timestamp list."""
+    cfg = _cfg()
+    ts_list = payload.get("ts_list") if isinstance(payload, dict) else None
+    if not isinstance(ts_list, list) or not ts_list:
+        raise HTTPException(status_code=400, detail="Body must include non-empty ts_list")
+    ts_clean = [str(x).strip() for x in ts_list if str(x).strip()]
+    if not ts_clean:
+        raise HTTPException(status_code=400, detail="No valid timestamps provided")
+    out = soft_delete_scans_by_ts(cfg, ts_clean)
+    return _jsonify({"ok": True, "requested": len(ts_clean), **out})
+
+
+@app.post("/api/scans/restore-batch")
+def restore_scan_batch(payload: dict = Body(...)):
+    cfg = _cfg()
+    ts_list = payload.get("ts_list") if isinstance(payload, dict) else None
+    if not isinstance(ts_list, list) or not ts_list:
+        raise HTTPException(status_code=400, detail="Body must include non-empty ts_list")
+    ts_clean = [str(x).strip() for x in ts_list if str(x).strip()]
+    if not ts_clean:
+        raise HTTPException(status_code=400, detail="No valid timestamps provided")
+    out = restore_scans_by_ts(cfg, ts_clean)
+    return _jsonify({"ok": True, "requested": len(ts_clean), **out})
+
+
+@app.post("/api/scans/hard-delete-batch")
+def hard_delete_scan_batch(payload: dict = Body(...)):
+    cfg = _cfg()
+    ts_list = payload.get("ts_list") if isinstance(payload, dict) else None
+    delete_files = bool(payload.get("delete_files", True)) if isinstance(payload, dict) else True
+    if not isinstance(ts_list, list) or not ts_list:
+        raise HTTPException(status_code=400, detail="Body must include non-empty ts_list")
+    ts_clean = [str(x).strip() for x in ts_list if str(x).strip()]
+    if not ts_clean:
+        raise HTTPException(status_code=400, detail="No valid timestamps provided")
+    out = hard_delete_scans_by_ts(cfg, ts_clean, delete_files=delete_files)
+    return _jsonify({"ok": True, "requested": len(ts_clean), **out})
 
 
 @app.get("/api/scans/{ts}/images")
@@ -153,12 +271,74 @@ def export_csv_route():
 def validation(
     limit: int = Query(50, ge=1, le=500),
     tire_id: str | None = None,
-    verdict: str | None = None
+    verdict: str | None = None,
+    include_deleted: bool = Query(False),
+    only_deleted: bool = Query(False),
 ):
     """List device validation results (Table 3.2 methodology)."""
     cfg = _cfg()
-    rows = list_validation_results(cfg, limit=limit, tire_id=tire_id, verdict=verdict)
-    return _jsonify({"items": rows, "limit": limit})
+    rows = list_validation_results(
+        cfg,
+        limit=limit,
+        tire_id=tire_id,
+        verdict=verdict,
+        include_deleted=include_deleted,
+        only_deleted=only_deleted,
+    )
+    return _jsonify({"items": rows, "limit": limit, "include_deleted": include_deleted, "only_deleted": only_deleted})
+
+
+@app.delete("/api/validation/{validation_id}")
+def delete_validation(validation_id: int):
+    """Move one validation entry to recycle bin."""
+    cfg = _cfg()
+    out = soft_delete_validation_by_id(cfg, validation_id)
+    if out.get("deleted", 0) == 0:
+        raise HTTPException(status_code=404, detail="Validation entry not found")
+    return _jsonify({"ok": True, "id": validation_id, **out})
+
+
+@app.post("/api/validation/{validation_id}/restore")
+def restore_validation(validation_id: int):
+    cfg = _cfg()
+    out = restore_validation_by_id(cfg, validation_id)
+    if out.get("restored", 0) == 0:
+        raise HTTPException(status_code=404, detail="Validation entry not found in recycle bin")
+    return _jsonify({"ok": True, "id": validation_id, **out})
+
+
+@app.delete("/api/validation/{validation_id}/hard")
+def hard_delete_validation(validation_id: int):
+    cfg = _cfg()
+    out = hard_delete_validation_by_id(cfg, validation_id)
+    if out.get("deleted", 0) == 0:
+        raise HTTPException(status_code=404, detail="Validation entry not found")
+    return _jsonify({"ok": True, "id": validation_id, **out})
+
+
+@app.post("/api/data/recycle-all")
+def recycle_all_data(include_validation: bool = Query(True)):
+    cfg = _cfg()
+    out = soft_delete_all_data(cfg, include_validation=include_validation)
+    return _jsonify({"ok": True, "include_validation": include_validation, **out})
+
+
+@app.post("/api/data/purge")
+def purge_all_data(
+    include_validation: bool = Query(True),
+    delete_files: bool = Query(True),
+    only_deleted: bool = Query(True),
+):
+    """Permanently delete data, usually only rows already moved to recycle bin."""
+    cfg = _cfg()
+    out = purge_data(cfg, include_validation=include_validation, delete_files=delete_files, only_deleted=only_deleted)
+    return _jsonify({
+        "ok": True,
+        "include_validation": include_validation,
+        "delete_files": delete_files,
+        "only_deleted": only_deleted,
+        **out,
+    })
 
 
 @app.get("/api/export/validation")
@@ -191,16 +371,21 @@ def submit_validation(
         )
 
     device_score = float(row.get("score") or 0.0)
+    calib = load_calibration(cfg.calibration_path)
+    device_depth = score_to_depth_mm(device_score, calib=calib)
 
-    # Compute device depth from linear model (slope=-6, intercept=6 default)
-    device_depth = max(0.0, -6.0 * device_score + 6.0)
+    vehicle_type = row.get("vehicle_type")
+    min_mm = _legal_min_depth_mm(cfg, vehicle_type)
+    manual_class = _tread_verdict_from_depth(cfg, float(manual_depth), vehicle_type)
+    device_class = _tread_verdict_from_depth(cfg, float(device_depth), vehicle_type)
+    class_match = (manual_class == device_class)
 
     abs_error = abs(device_depth - manual_depth)
     percent_diff = (abs_error / manual_depth * 100.0) if manual_depth > 0 else 0.0
 
     pass_pct = percent_diff <= 5.0
     pass_err = abs_error    <= 0.5
-    verdict  = "PASS" if (pass_pct and pass_err) else "FAIL"
+    verdict  = "PASS" if (pass_pct and pass_err and class_match) else "FAIL"
 
     from .storage import insert_validation_result
     insert_validation_result(cfg, {
@@ -213,7 +398,11 @@ def submit_validation(
         "abs_error_mm": abs_error,
         "processing_time": 0.0,
         "verdict": verdict,
-        "notes": f"Submitted via web dashboard | scan_ts={scan_ts}",
+        "notes": (
+          f"Submitted via web dashboard | scan_ts={scan_ts} | vehicle_type={vehicle_type} | "
+          f"legal_min={min_mm:.1f}mm | manual_class={manual_class} | device_class={device_class} | "
+          f"class_match={class_match}"
+        ),
     })
 
     return JSONResponse(content=_jsonify({
@@ -223,6 +412,11 @@ def submit_validation(
         "device_depth": device_depth,
         "percent_diff": percent_diff,
         "abs_error_mm": abs_error,
+        "vehicle_type": vehicle_type,
+        "legal_min_mm": min_mm,
+        "manual_class": manual_class,
+        "device_class": device_class,
+        "class_match": class_match,
         "verdict": verdict,
     }))
 
@@ -230,6 +424,11 @@ def submit_validation(
 @app.get("/")
 def index():
     """Serve the main TireGuard web dashboard."""
+    cfg = _cfg()
+    car_min_mm = _legal_min_depth_mm(cfg, "car")
+    car_warn_mm = _warning_band_mm(cfg, "car")
+    moto_min_mm = _legal_min_depth_mm(cfg, "motorcycle")
+    moto_warn_mm = _warning_band_mm(cfg, "motorcycle")
     html = """
 <!DOCTYPE html>
 <html lang="en">
@@ -368,6 +567,26 @@ def index():
     .btn-outline:hover {
       background-color: rgba(255, 255, 255, 0.1);
       border-color: rgba(255, 255, 255, 0.5);
+    }
+
+    .btn-danger {
+      background-color: #dc3545;
+      color: white;
+    }
+
+    .btn-danger:hover {
+      background-color: #bb2d3b;
+      transform: translateY(-2px);
+    }
+
+    .btn-subtle-danger {
+      background-color: rgba(220, 53, 69, 0.1);
+      color: #dc3545;
+      border: 1px solid rgba(220, 53, 69, 0.25);
+    }
+
+    .btn-subtle-danger:hover {
+      background-color: rgba(220, 53, 69, 0.18);
     }
 
     .toggle {
@@ -753,6 +972,110 @@ def index():
       overflow-y: auto;
     }
 
+    .validation-layout {
+      display: grid;
+      grid-template-columns: minmax(280px, 0.95fr) minmax(360px, 1.25fr);
+      gap: 1rem;
+      align-items: start;
+      margin-bottom: 1.25rem;
+    }
+
+    .guide-card {
+      background: linear-gradient(180deg, #f8fbff 0%, #eef4ff 100%);
+      border: 1px solid #cfe0ff;
+      border-radius: 14px;
+      padding: 1.25rem;
+      box-shadow: inset 0 1px 0 rgba(255,255,255,0.8);
+    }
+
+    .guide-card h3 {
+      font-size: 1rem;
+      font-weight: 800;
+      color: #1d4ed8;
+      margin-bottom: 0.35rem;
+    }
+
+    .guide-card p {
+      font-size: 0.84rem;
+      color: var(--gray-700);
+      line-height: 1.55;
+      margin-bottom: 0.8rem;
+    }
+
+    .guide-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 0.85rem;
+      font-size: 0.82rem;
+      background: rgba(255,255,255,0.9);
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .guide-table th,
+    .guide-table td {
+      padding: 0.7rem 0.65rem;
+      border-bottom: 1px solid #d9e3f7;
+      text-align: left;
+      vertical-align: top;
+    }
+
+    .guide-table th {
+      background: #dbeafe;
+      color: #1e3a8a;
+      font-weight: 800;
+      font-size: 0.78rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+
+    .guide-table tr:last-child td {
+      border-bottom: none;
+    }
+
+    .depth-chip {
+      display: inline-flex;
+      align-items: center;
+      padding: 0.18rem 0.48rem;
+      border-radius: 999px;
+      font-weight: 800;
+      font-size: 0.75rem;
+      white-space: nowrap;
+    }
+
+    .depth-chip.replace {
+      background: rgba(220, 38, 38, 0.12);
+      color: #b91c1c;
+    }
+
+    .depth-chip.warning {
+      background: rgba(245, 158, 11, 0.16);
+      color: #b45309;
+    }
+
+    .depth-chip.good {
+      background: rgba(22, 163, 74, 0.14);
+      color: #166534;
+    }
+
+    .guide-steps {
+      margin: 0;
+      padding-left: 1rem;
+      color: var(--gray-700);
+      font-size: 0.82rem;
+      line-height: 1.55;
+    }
+
+    .guide-note {
+      margin-top: 0.85rem;
+      padding: 0.8rem 0.9rem;
+      border-radius: 10px;
+      background: rgba(29, 78, 216, 0.08);
+      color: #1e3a8a;
+      font-size: 0.8rem;
+      font-weight: 600;
+    }
+
     /* Modal */
     .modal {
       position: fixed;
@@ -856,6 +1179,10 @@ def index():
         width: 100%;
       }
 
+      .validation-layout {
+        grid-template-columns: 1fr;
+      }
+
       .filters {
         grid-template-columns: 1fr;
       }
@@ -950,10 +1277,40 @@ def index():
     </div>
   </header>
 
+  <input type="checkbox" id="showRecycleBin" style="display:none;">
+
   <div class="container">
+    <div class="card" style="grid-column: 1 / -1;">
+      <div class="card-header">
+        <h2 class="card-title"><i class="fas fa-recycle"></i> Data Management</h2>
+      </div>
+      <div class="card-body" style="display:flex; gap:1rem; align-items:center; justify-content:space-between; flex-wrap:wrap;">
+        <div style="display:flex; gap:0.75rem; flex-wrap:wrap; align-items:center;">
+          <button id="btnViewActiveData" class="btn btn-primary">
+            <i class="fas fa-database"></i> Active Data
+          </button>
+          <button id="btnViewRecycleBin" class="btn btn-outline">
+            <i class="fas fa-trash-arrow-up"></i> Recycle Bin
+          </button>
+          <span id="recyclePolicyNote" style="font-size:0.9rem; color:var(--gray-600);">
+            Deleted items are auto-purged after 30 days.
+          </span>
+        </div>
+        <div style="font-size:0.9rem; color:var(--gray-700); font-weight:600;" id="currentDataMode">Viewing: Active Data</div>
+      </div>
+    </div>
+
     <div class="card">
       <div class="card-header">
         <h2 class="card-title"><i class="fas fa-list"></i> Recent Scans</h2>
+        <div class="controls">
+          <button id="btnDeleteSelectedScans" class="btn btn-subtle-danger">
+            <i class="fas fa-trash"></i> Delete Selected
+          </button>
+          <button id="btnPurgeAllData" class="btn btn-danger">
+            <i class="fas fa-trash-can"></i> Purge All Data
+          </button>
+        </div>
       </div>
       <div class="card-body">
         <div class="filters">
@@ -1039,6 +1396,7 @@ def index():
         <table id="scanTable">
           <thead>
             <tr>
+              <th><input type="checkbox" id="chkAllScans" title="Select all"></th>
               <th>Timestamp</th>
               <th>Verdict</th>
               <th>Score</th>
@@ -1056,6 +1414,7 @@ def index():
               <th>PSI Measured</th>
               <th>PSI Recommended</th>
               <th>PSI Status</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody id="tbody"></tbody>
@@ -1183,6 +1542,9 @@ def index():
       <div class="card-header">
         <h2 class="card-title"><i class="fas fa-balance-scale"></i> Device Validation (Table 3.2)</h2>
         <div class="controls">
+          <button class="btn btn-subtle-danger" id="btnDeleteSelectedVal">
+            <i class="fas fa-trash"></i> Delete Selected
+          </button>
           <button class="btn btn-outline" id="btnExportValidation">
             <i class="fas fa-file-csv"></i> Export Table 3.2
           </button>
@@ -1193,34 +1555,80 @@ def index():
       </div>
       <div class="card-body">
 
-        <!-- ✅ Submit Validation Form -->
-        <div id="valForm" style="background:#f0f4ff; border:1px solid #c7d7ff; border-radius:12px; padding:1.25rem; margin-bottom:1.25rem;">
-          <h3 style="font-size:1rem; font-weight:700; color:#1d4ed8; margin-bottom:1rem;">
-            <i class="fas fa-plus-circle"></i> Submit New Validation Entry
-          </h3>
-          <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:1rem; align-items:end;">
-            <div class="filter-group">
-              <label>Scan Timestamp</label>
-              <input type="text" id="valScanTs" placeholder="e.g. 20260207_152411" class="filter-control" style="background:white;">
-            </div>
-            <div class="filter-group">
-              <label>Tire ID</label>
-              <input type="text" id="valTireIdInput" placeholder="e.g. TEST-01" class="filter-control" style="background:white;">
-            </div>
-            <div class="filter-group">
-              <label>Manual Depth (mm)</label>
-              <input type="number" id="valManualDepth" placeholder="e.g. 3.5" step="0.1" min="0" max="15" class="filter-control" style="background:white;">
-            </div>
-            <div>
-              <button id="btnSubmitVal" class="btn" style="background:#1d4ed8; color:white; width:100%; justify-content:center; padding:0.7rem 1rem;">
-                <i class="fas fa-check-circle"></i> Submit Validation
-              </button>
+        <div class="validation-layout">
+          <div class="guide-card">
+            <h3><i class="fas fa-ruler-combined"></i> Industry Tread Measurement Guide</h3>
+            <p>
+              Use this reference when filling out Table 3.2 so the manual gauge reading follows the same tread thresholds used by the app.
+              Measure in millimeters from the main groove and compare that lowest stable reading against the device result.
+            </p>
+
+            <table class="guide-table">
+              <thead>
+                <tr>
+                  <th>Vehicle</th>
+                  <th>Replace</th>
+                  <th>Warning</th>
+                  <th>Good</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>Car</strong><br><span style="color:var(--gray-600);">Code-aligned threshold</span></td>
+                  <td><span class="depth-chip replace">&lt; __CAR_MIN_MM__ mm</span></td>
+                  <td><span class="depth-chip warning">__CAR_MIN_MM__ to &lt; __CAR_WARN_UPPER_MM__ mm</span></td>
+                  <td><span class="depth-chip good">>= __CAR_WARN_UPPER_MM__ mm</span></td>
+                </tr>
+                <tr>
+                  <td><strong>Motorcycle</strong><br><span style="color:var(--gray-600);">Code-aligned threshold</span></td>
+                  <td><span class="depth-chip replace">&lt; __MOTO_MIN_MM__ mm</span></td>
+                  <td><span class="depth-chip warning">__MOTO_MIN_MM__ to &lt; __MOTO_WARN_UPPER_MM__ mm</span></td>
+                  <td><span class="depth-chip good">>= __MOTO_WARN_UPPER_MM__ mm</span></td>
+                </tr>
+              </tbody>
+            </table>
+
+            <ol class="guide-steps">
+              <li>Clean the groove and remove trapped stones or debris before inserting the tread-depth gauge.</li>
+              <li>Place the gauge base flat on the tire and read from the main circumferential groove, not the tread block edge.</li>
+              <li>Check inner, center, and outer groove positions, then record the lowest stable millimeter value for Table 3.2.</li>
+              <li>Match the manual reading to the exact scan timestamp selected above so the validation entry compares like-for-like data.</li>
+            </ol>
+
+            <div class="guide-note">
+              Current warning bands in code: Car +__CAR_WARN_MM__ mm and Motorcycle +__MOTO_WARN_MM__ mm above the legal minimum before the verdict changes from WARNING to GOOD.
             </div>
           </div>
-          <div id="valFormResult" style="margin-top:0.75rem; display:none; padding:0.75rem; border-radius:8px; font-weight:600; font-size:0.9rem;"></div>
-          <p style="margin-top:0.75rem; font-size:0.78rem; color:#6c757d;">
-            💡 Tip: Click a scan row above to auto-fill the Scan Timestamp field.
-          </p>
+
+          <!-- ✅ Submit Validation Form -->
+          <div id="valForm" style="background:#f0f4ff; border:1px solid #c7d7ff; border-radius:12px; padding:1.25rem; margin-bottom:0;">
+            <h3 style="font-size:1rem; font-weight:700; color:#1d4ed8; margin-bottom:1rem;">
+              <i class="fas fa-plus-circle"></i> Submit New Validation Entry
+            </h3>
+            <div style="display:grid; grid-template-columns:repeat(auto-fit,minmax(200px,1fr)); gap:1rem; align-items:end;">
+              <div class="filter-group">
+                <label>Scan Timestamp</label>
+                <input type="text" id="valScanTs" placeholder="e.g. 20260207_152411" class="filter-control" style="background:white;">
+              </div>
+              <div class="filter-group">
+                <label>Tire ID</label>
+                <input type="text" id="valTireIdInput" placeholder="e.g. TEST-01" class="filter-control" style="background:white;">
+              </div>
+              <div class="filter-group">
+                <label>Manual Depth (mm)</label>
+                <input type="number" id="valManualDepth" placeholder="e.g. 3.5" step="0.1" min="0" max="15" class="filter-control" style="background:white;">
+              </div>
+              <div>
+                <button id="btnSubmitVal" class="btn" style="background:#1d4ed8; color:white; width:100%; justify-content:center; padding:0.7rem 1rem;">
+                  <i class="fas fa-check-circle"></i> Submit Validation
+                </button>
+              </div>
+            </div>
+            <div id="valFormResult" style="margin-top:0.75rem; display:none; padding:0.75rem; border-radius:8px; font-weight:600; font-size:0.9rem;"></div>
+            <p style="margin-top:0.75rem; font-size:0.78rem; color:#6c757d;">
+              💡 Tip: Click a scan row above to auto-fill the Scan Timestamp field.
+            </p>
+          </div>
         </div>
 
         <!-- Filters -->
@@ -1242,6 +1650,7 @@ def index():
         <table id="valTable">
           <thead>
             <tr>
+              <th><input type="checkbox" id="chkAllVal" title="Select all"></th>
               <th>Timestamp</th>
               <th>Tire ID</th>
               <th>Manual (mm)</th>
@@ -1251,6 +1660,7 @@ def index():
               <th>Time (s)</th>
               <th>Verdict</th>
               <th>Notes</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody id="valTbody"></tbody>
@@ -1317,6 +1727,35 @@ def index():
       const n = Number(v);
       return Number.isFinite(n) ? n.toFixed(digits) : fallback;
     }
+
+    function recycleMode() {
+      return !!$("showRecycleBin")?.checked;
+    }
+
+    function updateRecycleUi() {
+      const inRecycle = recycleMode();
+      if ($("btnViewActiveData")) {
+        $("btnViewActiveData").className = `btn ${inRecycle ? 'btn-outline' : 'btn-primary'}`;
+      }
+      if ($("btnViewRecycleBin")) {
+        $("btnViewRecycleBin").className = `btn ${inRecycle ? 'btn-primary' : 'btn-outline'}`;
+      }
+      if ($("currentDataMode")) {
+        $("currentDataMode").textContent = `Viewing: ${inRecycle ? 'Recycle Bin' : 'Active Data'}`;
+      }
+      $("btnDeleteSelectedScans").innerHTML = inRecycle
+        ? '<i class="fas fa-rotate-left"></i> Restore Selected'
+        : '<i class="fas fa-trash"></i> Delete Selected';
+      $("btnDeleteSelectedVal").innerHTML = inRecycle
+        ? '<i class="fas fa-rotate-left"></i> Restore Selected'
+        : '<i class="fas fa-trash"></i> Delete Selected';
+      $("btnPurgeAllData").innerHTML = inRecycle
+        ? '<i class="fas fa-trash-can"></i> Empty Recycle Bin'
+        : '<i class="fas fa-box-archive"></i> Move All To Recycle Bin';
+    }
+
+    let currentSelectedScanTs = null;
+    let lastFilteredScans = [];
 
     async function api(path) {
       const res = await fetch(path);
@@ -1398,20 +1837,22 @@ def index():
         if (qVerdict) query.set("verdict", qVerdict);
         if (qTireType) query.set("tire_type", qTireType);
         if (qTreadDesign) query.set("tread_design", qTreadDesign);
+        if (recycleMode()) query.set("only_deleted", "true");
 
         const res = await api(`/api/scans?${query.toString()}`);
         const data = await res.json();
         const items = Array.isArray(data.items) ? data.items : [];
         const filtered = applyFilters(items);
+        lastFilteredScans = filtered;
         const tbody = $("tbody");
         tbody.innerHTML = "";
 
         if (filtered.length === 0) {
           tbody.innerHTML = `
             <tr>
-              <td colspan="17" style="text-align: center; padding: 2rem; color: #6c757d;">
+              <td colspan="19" style="text-align: center; padding: 2rem; color: #6c757d;">
                 <i class="fas fa-search" style="font-size: 2rem; margin-bottom: 1rem; opacity: 0.3;"></i>
-                <p>No scans match your criteria</p>
+                <p>${recycleMode() ? 'Recycle bin is empty' : 'No scans match your criteria'}</p>
                 <button id="resetFilters" class="btn btn-outline" style="margin-top: 1rem;">
                   <i class="fas fa-undo"></i> Reset Filters
                 </button>
@@ -1458,8 +1899,16 @@ def index():
             const psiMeasured = row.psi_measured == null ? "—" : Number(row.psi_measured).toFixed(1);
             const psiRec = row.psi_recommended == null ? "—" : Number(row.psi_recommended).toFixed(1);
             const psiStatus = get("psi_status", "—");
+            const rowTs = ts;
+            const actionCell = recycleMode()
+              ? `<td>
+                  <button class="btn btn-outline btn-restore-scan" data-ts="${rowTs}" style="padding:0.35rem 0.55rem;"><i class="fas fa-rotate-left"></i></button>
+                  <button class="btn btn-subtle-danger btn-hard-del-scan" data-ts="${rowTs}" style="padding:0.35rem 0.55rem;"><i class="fas fa-trash-can"></i></button>
+                </td>`
+              : `<td><button class="btn btn-subtle-danger btn-del-scan" data-ts="${rowTs}" style="padding:0.35rem 0.55rem;"><i class="fas fa-trash"></i></button></td>`;
 
             tr.innerHTML = `
+              <td><input type="checkbox" class="scan-chk" data-ts="${rowTs}"></td>
               <td>${ts}</td>
               <td><span class="verdict-badge ${verdictClass(verdict)}">${verdict}</span></td>
               <td>${score}</td>
@@ -1477,8 +1926,31 @@ def index():
               <td>${psiMeasured}</td>
               <td>${psiRec}</td>
               <td><span class="verdict-badge ${verdictClass(psiStatus)}">${psiStatus}</span></td>
+              ${actionCell}
             `;
             tbody.appendChild(tr);
+          });
+
+          tbody.querySelectorAll(".scan-chk, .btn-del-scan").forEach((el) => {
+            el.addEventListener("click", (e) => e.stopPropagation());
+          });
+          tbody.querySelectorAll(".btn-del-scan").forEach((btn) => {
+            btn.addEventListener("click", async (e) => {
+              const ts = e.currentTarget.getAttribute("data-ts");
+              await deleteSingleScan(ts);
+            });
+          });
+          tbody.querySelectorAll(".btn-restore-scan").forEach((btn) => {
+            btn.addEventListener("click", async (e) => {
+              const ts = e.currentTarget.getAttribute("data-ts");
+              await restoreSingleScan(ts);
+            });
+          });
+          tbody.querySelectorAll(".btn-hard-del-scan").forEach((btn) => {
+            btn.addEventListener("click", async (e) => {
+              const ts = e.currentTarget.getAttribute("data-ts");
+              await hardDeleteSingleScan(ts);
+            });
           });
         }
 
@@ -1497,12 +1969,121 @@ def index():
       }
     }
 
+    async function deleteSingleScan(ts) {
+      if (!ts) return;
+      if (!confirm(`Move scan ${ts} to recycle bin?`)) return;
+      try {
+        const res = await fetch(`/api/scans/${encodeURIComponent(ts)}`, { method: "DELETE" });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(payload.detail || `Delete failed (${res.status})`);
+        if (currentSelectedScanTs === ts) {
+          currentSelectedScanTs = null;
+          $("selTs").textContent = "Select a scan from the list";
+          $("selVerdict").textContent = "—";
+        }
+        await loadScans();
+        await loadValidation();
+        status(`Moved scan ${ts} to recycle bin`);
+      } catch (err) {
+        status(`Delete error: ${err.message}`);
+      }
+    }
+
+    async function restoreSingleScan(ts) {
+      if (!ts) return;
+      try {
+        const res = await fetch(`/api/scans/${encodeURIComponent(ts)}/restore`, { method: "POST" });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(payload.detail || `Restore failed (${res.status})`);
+        await loadScans();
+        await loadValidation();
+        status(`Restored scan ${ts}`);
+      } catch (err) {
+        status(`Restore error: ${err.message}`);
+      }
+    }
+
+    async function hardDeleteSingleScan(ts) {
+      if (!ts) return;
+      if (!confirm(`Permanently delete scan ${ts} and its files? This cannot be undone.`)) return;
+      try {
+        const res = await fetch(`/api/scans/${encodeURIComponent(ts)}/hard?delete_files=true`, { method: "DELETE" });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(payload.detail || `Hard delete failed (${res.status})`);
+        await loadScans();
+        await loadValidation();
+        status(`Permanently deleted scan ${ts}`);
+      } catch (err) {
+        status(`Hard delete error: ${err.message}`);
+      }
+    }
+
+    async function deleteSelectedScans() {
+      const tsList = Array.from(document.querySelectorAll(".scan-chk:checked")).map((x) => x.getAttribute("data-ts"));
+      if (!tsList.length) {
+        alert("No scans selected.");
+        return;
+      }
+      const inRecycle = recycleMode();
+      if (!confirm(inRecycle
+        ? `Restore ${tsList.length} selected scan(s)?`
+        : `Move ${tsList.length} selected scan(s) to recycle bin?`)) return;
+      try {
+        const res = await fetch(inRecycle ? "/api/scans/restore-batch" : "/api/scans/delete-batch", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ ts_list: tsList }),
+        });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(payload.detail || `${inRecycle ? 'Batch restore' : 'Batch delete'} failed (${res.status})`);
+        if (currentSelectedScanTs && tsList.includes(currentSelectedScanTs)) {
+          currentSelectedScanTs = null;
+          $("selTs").textContent = "Select a scan from the list";
+          $("selVerdict").textContent = "—";
+        }
+        await loadScans();
+        await loadValidation();
+        status(inRecycle
+          ? `Restored ${payload.restored || tsList.length} scan(s)`
+          : `Moved ${payload.deleted || tsList.length} scan(s) to recycle bin`);
+      } catch (err) {
+        status(`${inRecycle ? 'Batch restore' : 'Batch delete'} error: ${err.message}`);
+      }
+    }
+
+    async function purgeAllData() {
+      const inRecycle = recycleMode();
+      if (!confirm(inRecycle
+        ? "Permanently delete all items currently in the recycle bin? This cannot be undone."
+        : "Move all active scans and validation rows to the recycle bin?")) return;
+      try {
+        const res = await fetch(
+          inRecycle
+            ? "/api/data/purge?include_validation=true&delete_files=true&only_deleted=true"
+            : "/api/data/recycle-all?include_validation=true",
+          { method: "POST" }
+        );
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(payload.detail || `Purge failed (${res.status})`);
+        currentSelectedScanTs = null;
+        await loadScans();
+        await loadValidation();
+        status(inRecycle
+          ? `Recycle bin emptied: ${payload.results_deleted || 0} scans, ${payload.validation_deleted || 0} validation rows`
+          : `Moved to recycle bin: ${payload.results_deleted || 0} scans, ${payload.validation_deleted || 0} validation rows`);
+      } catch (err) {
+        status(`Purge error: ${err.message}`);
+      }
+    }
+
     async function selectScan(ts) {
+      currentSelectedScanTs = ts;
       $("selTs").textContent = ts;
       status("Loading scan details...");
       
       try {
-        const res = await api(`/api/scans/${encodeURIComponent(ts)}`);
+        const suffix = recycleMode() ? "?include_deleted=true" : "";
+        const res = await api(`/api/scans/${encodeURIComponent(ts)}${suffix}`);
         const row = await res.json();
 
         const verdict = row.verdict || "";
@@ -1598,6 +2179,7 @@ def index():
         query.append("limit", 100);
         if (tireId) query.append("tire_id", tireId);
         if (verdict) query.append("verdict", verdict);
+        if (recycleMode()) query.append("only_deleted", "true");
         
         const res = await api(`/api/validation?${query}`);
         const data = await res.json();
@@ -1608,8 +2190,8 @@ def index():
         if (items.length === 0) {
           tbody.innerHTML = `
             <tr>
-              <td colspan="9" style="text-align: center; padding: 2rem; color: #6c757d;">
-                No validation results found
+              <td colspan="11" style="text-align: center; padding: 2rem; color: #6c757d;">
+                ${recycleMode() ? 'Validation recycle bin is empty' : 'No validation results found'}
               </td>
             </tr>
           `;
@@ -1617,6 +2199,7 @@ def index():
         } else {
           items.forEach((row) => {
             const tr = document.createElement("tr");
+            const rowId = row.id;
             const ts         = row.ts || row.created_at || "—";
             const tireId     = row.tire_id || "—";
             const manualDepth  = typeof row.manual_depth  === "number" ? row.manual_depth.toFixed(2)  : "—";
@@ -1627,7 +2210,15 @@ def index():
             const verd         = row.verdict || "—";
             const notes        = row.notes || "—";
 
+            const actionCell = recycleMode()
+              ? `<td>
+                  <button class="btn btn-outline btn-restore-val" data-id="${rowId}" style="padding:0.35rem 0.55rem;"><i class="fas fa-rotate-left"></i></button>
+                  <button class="btn btn-subtle-danger btn-hard-del-val" data-id="${rowId}" style="padding:0.35rem 0.55rem;"><i class="fas fa-trash-can"></i></button>
+                </td>`
+              : `<td><button class="btn btn-subtle-danger btn-del-val" data-id="${rowId}" style="padding:0.35rem 0.55rem;"><i class="fas fa-trash"></i></button></td>`;
+
             tr.innerHTML = `
+              <td><input type="checkbox" class="val-chk" data-id="${rowId}"></td>
               <td>${ts}</td>
               <td><strong>${tireId}</strong></td>
               <td>${manualDepth}</td>
@@ -1637,8 +2228,28 @@ def index():
               <td>${procTime}</td>
               <td><span class="verdict-badge ${verdictClass(verd)}">${verd}</span></td>
               <td style="font-size:0.75rem; color:#6c757d; max-width:180px; white-space:normal;">${notes}</td>
+              ${actionCell}
             `;
             tbody.appendChild(tr);
+          });
+
+          tbody.querySelectorAll(".btn-del-val").forEach((btn) => {
+            btn.addEventListener("click", async (e) => {
+              const id = e.currentTarget.getAttribute("data-id");
+              await deleteSingleValidation(id);
+            });
+          });
+          tbody.querySelectorAll(".btn-restore-val").forEach((btn) => {
+            btn.addEventListener("click", async (e) => {
+              const id = e.currentTarget.getAttribute("data-id");
+              await restoreSingleValidation(id);
+            });
+          });
+          tbody.querySelectorAll(".btn-hard-del-val").forEach((btn) => {
+            btn.addEventListener("click", async (e) => {
+              const id = e.currentTarget.getAttribute("data-id");
+              await hardDeleteSingleValidation(id);
+            });
           });
 
           // Summary stats
@@ -1663,6 +2274,68 @@ def index():
       }
     }
 
+    async function deleteSingleValidation(id, askConfirm = true) {
+      if (!id) return;
+      if (askConfirm && !confirm(`Move validation row #${id} to recycle bin?`)) return;
+      try {
+        const res = await fetch(`/api/validation/${encodeURIComponent(id)}`, { method: "DELETE" });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(payload.detail || `Delete failed (${res.status})`);
+        await loadValidation();
+        status(`Moved validation #${id} to recycle bin`);
+      } catch (err) {
+        status(`Validation delete error: ${err.message}`);
+      }
+    }
+
+    async function restoreSingleValidation(id) {
+      if (!id) return;
+      try {
+        const res = await fetch(`/api/validation/${encodeURIComponent(id)}/restore`, { method: "POST" });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(payload.detail || `Restore failed (${res.status})`);
+        await loadValidation();
+        status(`Restored validation #${id}`);
+      } catch (err) {
+        status(`Validation restore error: ${err.message}`);
+      }
+    }
+
+    async function hardDeleteSingleValidation(id) {
+      if (!id) return;
+      if (!confirm(`Permanently delete validation row #${id}? This cannot be undone.`)) return;
+      try {
+        const res = await fetch(`/api/validation/${encodeURIComponent(id)}/hard`, { method: "DELETE" });
+        const payload = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(payload.detail || `Hard delete failed (${res.status})`);
+        await loadValidation();
+        status(`Permanently deleted validation #${id}`);
+      } catch (err) {
+        status(`Validation hard delete error: ${err.message}`);
+      }
+    }
+
+    async function deleteSelectedValidationRows() {
+      const ids = Array.from(document.querySelectorAll(".val-chk:checked")).map((x) => x.getAttribute("data-id"));
+      if (!ids.length) {
+        alert("No validation rows selected.");
+        return;
+      }
+      const inRecycle = recycleMode();
+      if (!confirm(inRecycle
+        ? `Restore ${ids.length} selected validation row(s)?`
+        : `Move ${ids.length} selected validation row(s) to recycle bin?`)) return;
+      for (const id of ids) {
+        // Best-effort sequential delete to keep API surface simple and robust.
+        if (inRecycle) {
+          await restoreSingleValidation(id);
+        } else {
+          await deleteSingleValidation(id, false);
+        }
+      }
+      await loadValidation();
+    }
+
     let pollTimer = null;
     function startPolling() {
       if (pollTimer) clearInterval(pollTimer);
@@ -1673,8 +2346,30 @@ def index():
 
     $("btnRefresh").onclick = loadScans;
     $("btnExport").onclick = () => { window.location.href = "/api/export/csv"; };
+    $("btnDeleteSelectedScans").onclick = deleteSelectedScans;
+    $("btnPurgeAllData").onclick = purgeAllData;
     $("btnExportValidation").onclick = () => { window.location.href = "/api/export/validation"; };
     $("btnRefreshVal").onclick = loadValidation;
+    $("btnDeleteSelectedVal").onclick = deleteSelectedValidationRows;
+    $("showRecycleBin").onchange = () => {
+      updateRecycleUi();
+      loadScans();
+      loadValidation();
+    };
+    $("btnViewActiveData").onclick = () => {
+      $("showRecycleBin").checked = false;
+      $("showRecycleBin").dispatchEvent(new Event("change"));
+    };
+    $("btnViewRecycleBin").onclick = () => {
+      $("showRecycleBin").checked = true;
+      $("showRecycleBin").dispatchEvent(new Event("change"));
+    };
+    $("chkAllScans").onchange = (e) => {
+      document.querySelectorAll(".scan-chk").forEach((x) => { x.checked = !!e.target.checked; });
+    };
+    $("chkAllVal").onchange = (e) => {
+      document.querySelectorAll(".val-chk").forEach((x) => { x.checked = !!e.target.checked; });
+    };
     $("autoRefresh").onchange = startPolling;
 
     // ✅ Auto-fill scan timestamp when clicking a scan row
@@ -1792,6 +2487,7 @@ def index():
     };
 
     document.addEventListener('DOMContentLoaded', () => {
+      updateRecycleUi();
       loadScans();
       loadValidation();
       startPolling();
@@ -1799,6 +2495,15 @@ def index():
   </script>
 </body>
 </html>"""
+    html = (
+        html
+        .replace("__CAR_MIN_MM__", f"{car_min_mm:.1f}")
+        .replace("__CAR_WARN_MM__", f"{car_warn_mm:.1f}")
+        .replace("__CAR_WARN_UPPER_MM__", f"{(car_min_mm + car_warn_mm):.1f}")
+        .replace("__MOTO_MIN_MM__", f"{moto_min_mm:.1f}")
+        .replace("__MOTO_WARN_MM__", f"{moto_warn_mm:.1f}")
+        .replace("__MOTO_WARN_UPPER_MM__", f"{(moto_min_mm + moto_warn_mm):.1f}")
+    )
     return HTMLResponse(html)
 
 

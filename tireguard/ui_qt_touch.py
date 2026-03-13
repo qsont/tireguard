@@ -29,16 +29,31 @@ from .camera import open_camera
 from .preprocess import crop_roi, preprocess_bgr
 from .quality import run_quality_checks
 from .measure import groove_visibility_score, pass_fail_from_score
+from .calibration import load_calibration, score_to_depth_mm
 from .storage import (
     export_csv,
     find_processed_images,
     get_result_by_ts,
+    hard_delete_scan_by_ts,
     init_db,
     insert_result,
     list_results,
     save_capture,
     save_processed,
+    restore_scan_by_ts,
+    soft_delete_scan_by_ts,
 )
+
+
+LEGAL_MIN_DEPTH_MM = {
+    "car": 1.6,
+    "motorcycle": 1.0,
+}
+
+DEFAULT_WARNING_BAND_MM = {
+    "car": 0.4,
+    "motorcycle": 0.4,
+}
 
 
 def bgr_to_qimage(frame_bgr):
@@ -183,6 +198,9 @@ class MainWindow(QMainWindow):
         self.cap = None
         self.cam_index = None
         self.roi: Optional[Dict[str, int]] = None
+        self.calib = load_calibration(cfg.calibration_path)
+        self._last_scan_depth_mm = None
+        self._last_scan_vehicle_type = None
         self.psi_default_recommended = 32.0
         self.psi_good_delta = 1.5
         self.psi_warn_delta = 3.0
@@ -310,6 +328,14 @@ class MainWindow(QMainWindow):
         self.scan_buttons2.addWidget(self.btn_export, 1)
         scan_layout.addLayout(self.scan_buttons2)
 
+        self.depth_policy_info = QTextEdit()
+        self.depth_policy_info.setReadOnly(True)
+        self.depth_policy_info.setMinimumHeight(120)
+        self.depth_policy_info.setMaximumHeight(150)
+        default_vehicle_type = self.in_vehicle_type.currentText() if hasattr(self, "in_vehicle_type") else "Car"
+        self.depth_policy_info.setHtml(self._depth_policy_text(default_vehicle_type))
+        scan_layout.addWidget(self.depth_policy_info)
+
         self.result = QTextEdit()
         self.result.setReadOnly(True)
         self.result.setMinimumHeight(88)
@@ -392,9 +418,28 @@ class MainWindow(QMainWindow):
         self.history.setMinimumHeight(120)
         self.history.itemSelectionChanged.connect(self._on_history_select)
         history_layout.addWidget(self.history)
-        btn_hist_refresh = QPushButton("Refresh History")
+
+        hist_ctrl = QWidget()
+        hist_ctrl_layout = QHBoxLayout(hist_ctrl)
+        hist_ctrl_layout.setContentsMargins(0, 0, 0, 0)
+        hist_ctrl_layout.setSpacing(6)
+        self.history_mode = QComboBox()
+        self.history_mode.addItems(["Active", "Recycle Bin"])
+        self.history_mode.currentTextChanged.connect(self._on_history_mode_changed)
+        self.btn_hist_delete = QPushButton("Delete")
+        self.btn_hist_delete.clicked.connect(self._delete_selected_history_scan)
+        self.btn_hist_restore = QPushButton("Restore")
+        self.btn_hist_restore.clicked.connect(self._restore_selected_history_scan)
+        self.btn_hist_hard_delete = QPushButton("Hard Delete")
+        self.btn_hist_hard_delete.clicked.connect(self._hard_delete_selected_history_scan)
+        btn_hist_refresh = QPushButton("Refresh")
         btn_hist_refresh.clicked.connect(self._refresh_history)
-        history_layout.addWidget(btn_hist_refresh)
+        hist_ctrl_layout.addWidget(self.history_mode)
+        hist_ctrl_layout.addWidget(self.btn_hist_delete)
+        hist_ctrl_layout.addWidget(self.btn_hist_restore)
+        hist_ctrl_layout.addWidget(self.btn_hist_hard_delete)
+        hist_ctrl_layout.addWidget(btn_hist_refresh)
+        history_layout.addWidget(hist_ctrl)
 
         tab_settings = QWidget()
         set_layout = QFormLayout(tab_settings)
@@ -415,11 +460,18 @@ class MainWindow(QMainWindow):
         self.psi_good_input.setValidator(psi_validator)
         self.psi_warn_input = QLineEdit(f"{self.psi_warn_delta:.1f}")
         self.psi_warn_input.setValidator(psi_validator)
+        self.depth_warn_validator = QDoubleValidator(0.0, 5.0, 2)
+        self.depth_car_warn_input = QLineEdit(str(getattr(self.cfg, "car_warning_band_mm", DEFAULT_WARNING_BAND_MM["car"])))
+        self.depth_car_warn_input.setValidator(self.depth_warn_validator)
+        self.depth_moto_warn_input = QLineEdit(str(getattr(self.cfg, "motorcycle_warning_band_mm", DEFAULT_WARNING_BAND_MM["motorcycle"])))
+        self.depth_moto_warn_input.setValidator(self.depth_warn_validator)
         set_layout.addRow("Camera", self.cam_idx)
         set_layout.addRow("Resolution", self.res_combo)
         set_layout.addRow("Default PSI", self.psi_default_input)
         set_layout.addRow("Good ±", self.psi_good_input)
         set_layout.addRow("Warn ±", self.psi_warn_input)
+        set_layout.addRow("Car Warn Band (mm)", self.depth_car_warn_input)
+        set_layout.addRow("Moto Warn Band (mm)", self.depth_moto_warn_input)
         set_layout.addRow(self.btn_open_cam)
 
         self.tabs.addTab(self._wrap_tab_scroll(tab_scan), "Scan")
@@ -435,6 +487,8 @@ class MainWindow(QMainWindow):
         self.psi_default_input.textChanged.connect(self._update_psi_status_label)
         self.psi_good_input.textChanged.connect(self._update_psi_status_label)
         self.psi_warn_input.textChanged.connect(self._update_psi_status_label)
+        self.depth_car_warn_input.textChanged.connect(self._persist_depth_policy_settings)
+        self.depth_moto_warn_input.textChanged.connect(self._persist_depth_policy_settings)
         self._update_roi_info()
         self._update_psi_status_label()
         self._refresh_history()
@@ -547,7 +601,99 @@ class MainWindow(QMainWindow):
         if not self.roi:
             self.roi_info.setText("ROI: not set")
             return
-        self.roi_info.setText(f"ROI: {self.roi['w']} x {self.roi['h']} px")
+        msg = f"ROI: {self.roi['w']} x {self.roi['h']} px"
+        mm_per_px = self.calib.get("mm_per_px") if isinstance(self.calib, dict) else None
+        if mm_per_px:
+            msg += f" | {self.roi['w'] * float(mm_per_px):.1f} x {self.roi['h'] * float(mm_per_px):.1f} mm"
+        self.roi_info.setText(msg)
+
+    def _score_to_depth_mm(self, score: float) -> float:
+        try:
+            return score_to_depth_mm(float(score), calib=self.calib)
+        except Exception:
+            return score_to_depth_mm(float(score), calib=None)
+
+    def _legal_min_depth_mm(self, vehicle_type: Optional[str]) -> float:
+        v = (vehicle_type or "car").strip().lower()
+        if v == "car":
+            return float(getattr(self.cfg, "car_legal_min_depth_mm", LEGAL_MIN_DEPTH_MM["car"]))
+        if v == "motorcycle":
+            return float(getattr(self.cfg, "motorcycle_legal_min_depth_mm", LEGAL_MIN_DEPTH_MM["motorcycle"]))
+        return LEGAL_MIN_DEPTH_MM["car"]
+
+    def _warning_band_mm(self, vehicle_type: Optional[str]) -> float:
+        v = (vehicle_type or "car").strip().lower()
+        car_v = self._to_float_or_none(self.depth_car_warn_input.text()) if hasattr(self, "depth_car_warn_input") else None
+        moto_v = self._to_float_or_none(self.depth_moto_warn_input.text()) if hasattr(self, "depth_moto_warn_input") else None
+        if car_v is not None:
+            self.cfg.car_warning_band_mm = max(0.0, car_v)
+        if moto_v is not None:
+            self.cfg.motorcycle_warning_band_mm = max(0.0, moto_v)
+        if v == "car":
+            return float(getattr(self.cfg, "car_warning_band_mm", DEFAULT_WARNING_BAND_MM["car"]))
+        if v == "motorcycle":
+            return float(getattr(self.cfg, "motorcycle_warning_band_mm", DEFAULT_WARNING_BAND_MM["motorcycle"]))
+        return DEFAULT_WARNING_BAND_MM["car"]
+
+    def _persist_depth_policy_settings(self, *_):
+        car_v = self._to_float_or_none(self.depth_car_warn_input.text()) if hasattr(self, "depth_car_warn_input") else None
+        moto_v = self._to_float_or_none(self.depth_moto_warn_input.text()) if hasattr(self, "depth_moto_warn_input") else None
+        if car_v is not None:
+            self.cfg.car_warning_band_mm = max(0.0, car_v)
+        if moto_v is not None:
+            self.cfg.motorcycle_warning_band_mm = max(0.0, moto_v)
+        try:
+            self.cfg.save_runtime_settings()
+        except Exception as e:
+            print(f"[WARN] Could not persist runtime settings: {e}")
+        self._refresh_depth_policy_info()
+
+    def _depth_policy_text(self, vehicle_type: Optional[str]) -> str:
+        def chip(label: str) -> str:
+            colors = {"REPLACE": ("#c0392b", "#fff"), "WARNING": ("#e67e22", "#fff"), "GOOD": ("#27ae60", "#fff")}
+            bg, fg = colors.get(label.upper(), ("#555555", "#fff"))
+            return f'<span style="background-color:{bg};color:{fg};font-weight:bold;padding:1px 5px;">{label}</span>'
+
+        vt = (vehicle_type or "Car").strip()
+        min_mm = self._legal_min_depth_mm(vt)
+        warn_band = self._warning_band_mm(vt)
+        good_threshold = min_mm + warn_band
+
+        if vt.lower() == "motorcycle":
+            ref = "Legal min: 1.0 mm (jurisdiction-dependent)."
+            guidance = "New: ~4&#8211;7 mm &nbsp; Near-limit: ~1.0&#8211;1.5 mm"
+        else:
+            ref = "DOT/US/EU car legal minimum: 1.6 mm."
+            guidance = "New: ~7&#8211;8 mm &nbsp; Good: ~4&#8211;6 mm &nbsp; Worn: ~2&#8211;4 mm"
+
+        html = (
+            f"<b>Industry Ref</b>: {ref}<br>"
+            f"<b>Policy</b> min {min_mm:.1f} mm band +{warn_band:.1f} mm&nbsp;&nbsp;"
+            f"{chip('REPLACE')} &lt;{min_mm:.1f}&nbsp;&nbsp;"
+            f"{chip('WARNING')} {min_mm:.1f}&#8211;{good_threshold:.1f}&nbsp;&nbsp;"
+            f"{chip('GOOD')} &#8805;{good_threshold:.1f} mm<br>"
+            f"<b>Guide</b>: {guidance}"
+        )
+        if getattr(self, "_last_scan_depth_mm", None) is not None:
+            last_v = self._tread_verdict_from_depth(self._last_scan_depth_mm, self._last_scan_vehicle_type or vt)
+            html += (
+                f"<br><b>Last Scan:</b>&nbsp;{chip(last_v)}&nbsp;{self._last_scan_depth_mm:.3f} mm"
+            )
+        return html
+
+    def _refresh_depth_policy_info(self):
+        if hasattr(self, "depth_policy_info"):
+            vehicle_type = self.in_vehicle_type.currentText() if hasattr(self, "in_vehicle_type") else "Car"
+            self.depth_policy_info.setHtml(self._depth_policy_text(vehicle_type))
+
+    def _tread_verdict_from_depth(self, depth_mm: float, vehicle_type: Optional[str]) -> str:
+        min_mm = self._legal_min_depth_mm(vehicle_type)
+        warn_band = max(0.0, self._warning_band_mm(vehicle_type))
+        if depth_mm < min_mm:
+            return "REPLACE"
+        if depth_mm < (min_mm + warn_band):
+            return "WARNING"
+        return "GOOD"
 
     def _load_roi(self):
         try:
@@ -609,6 +755,7 @@ class MainWindow(QMainWindow):
             self.in_tire.addItems(["F (Front)", "R (Rear)"])
         else:
             self.in_tire.addItems(["FL", "FR", "RL", "RR", "SPARE"])
+        self._refresh_depth_policy_info()
 
     def _get_psi_settings(self) -> Tuple[float, float, float]:
         good = self._to_float_or_none(self.psi_good_input.text()) if hasattr(self, "psi_good_input") else None
@@ -719,10 +866,13 @@ class MainWindow(QMainWindow):
         q = run_quality_checks(processed["gray"], self.cfg)
         edges = processed.get("edges_closed", processed.get("edges"))
         m = groove_visibility_score(edges)
-        tread_verdict = pass_fail_from_score(float(m["score"]))
+        raw_score_verdict = pass_fail_from_score(float(m["score"]))
+        device_depth = self._score_to_depth_mm(float(m["score"]))
+        vehicle_type = self.in_vehicle_type.currentText()
+        tread_verdict = self._tread_verdict_from_depth(device_depth, vehicle_type)
         psi_status = self._psi_verdict(psi_measured, psi_recommended)
         verdict = tread_verdict
-        if psi_status == "CRITICAL":
+        if psi_status.startswith("CRITICAL"):
             verdict = "REPLACE"
 
         meta = {
@@ -766,12 +916,17 @@ class MainWindow(QMainWindow):
                 "edge_density": float(m["edge_density"]),
                 "continuity": float(m["continuity"]),
                 "score": float(m["score"]),
+                "device_depth_mm": float(device_depth),
+                "raw_score_verdict": raw_score_verdict,
                 "verdict": verdict,
                 "tread_verdict": tread_verdict,
                 "psi_measured": psi_measured,
                 "psi_recommended": psi_recommended,
                 "psi_status": psi_status,
-                "notes": "; ".join(q["reasons"]) if not q["ok"] else "",
+                "notes": (
+                    (("; ".join(q["reasons"]) + " | ") if not q["ok"] else "")
+                    + f"depth_mm={device_depth:.3f}; raw_score_verdict={raw_score_verdict}"
+                ),
                 "vehicle_type": self.in_vehicle_type.currentText(),
                 "vehicle_id": vehicle or None,
                 "tire_model_code": self.in_tire_model.text().strip() or None,
@@ -796,11 +951,16 @@ class MainWindow(QMainWindow):
             f"PSI Recommended: {psi_recommended:.1f}\n"
             f"PSI Status: {psi_status}\n"
             f"Tread Verdict: {tread_verdict}\n"
+            f"Depth (calibrated): {device_depth:.3f} mm\n"
             f"Score: {float(m['score']):.4f}\n"
+            f"Raw Score Verdict: {raw_score_verdict}\n"
             f"Final Verdict: {verdict}\n"
             f"Brightness: {float(q['metrics']['brightness']):.2f}\n"
             f"Sharpness: {float(q['metrics']['sharpness']):.2f}\n"
         )
+        self._last_scan_depth_mm = device_depth
+        self._last_scan_vehicle_type = vehicle_type
+        self._refresh_depth_policy_info()
         self._set_status(f"Captured: {verdict}")
         self._refresh_history()
 
@@ -812,18 +972,25 @@ class MainWindow(QMainWindow):
     def _refresh_history(self):
         if not hasattr(self, "history"):
             return
+        self.history.blockSignals(True)
         self.history.clear()
-        for row in list_results(self.cfg, limit=30):
+        only_deleted = hasattr(self, "history_mode") and self.history_mode.currentText() == "Recycle Bin"
+        for row in list_results(self.cfg, limit=30, only_deleted=only_deleted):
             score = float(row.get("score", 0.0)) if row.get("score") is not None else 0.0
             self.history.addItem(f"{row['ts']} | {row['verdict']} | {score:.4f}")
+        self.history.blockSignals(False)
+        self._update_history_action_buttons()
 
     def _on_history_select(self):
         if not hasattr(self, "history") or not self.history.selectedItems():
+            self._update_history_action_buttons()
             return
         line = self.history.selectedItems()[0].text()
         ts = line.split("|")[0].strip()
-        row = get_result_by_ts(self.cfg, ts)
+        only_deleted = hasattr(self, "history_mode") and self.history_mode.currentText() == "Recycle Bin"
+        row = get_result_by_ts(self.cfg, ts, include_deleted=only_deleted)
         if not row:
+            self._update_history_action_buttons()
             return
         imgs = find_processed_images(self.cfg, ts)
         self.result.setPlainText(
@@ -835,10 +1002,69 @@ class MainWindow(QMainWindow):
             f"PSI Recommended: {row.get('psi_recommended') if row.get('psi_recommended') is not None else '-'}\n"
             f"PSI Status: {row.get('psi_status') or '-'}\n"
             f"Tread Verdict: {row.get('tread_verdict') or '-'}\n"
+            f"Depth (calibrated): {row.get('device_depth_mm') if row.get('device_depth_mm') is not None else '-'}\n"
+            f"Raw Score Verdict: {row.get('raw_score_verdict') or '-'}\n"
             f"Score: {float(row.get('score') or 0.0):.4f}\n"
             f"Verdict: {row.get('verdict') or '-'}\n"
             f"Processed files: {', '.join(sorted(imgs.keys())) if imgs else 'none'}\n"
         )
+        self._update_history_action_buttons()
+
+    def _selected_history_ts(self) -> Optional[str]:
+        if not hasattr(self, "history") or not self.history.selectedItems():
+            return None
+        return self.history.selectedItems()[0].text().split("|")[0].strip()
+
+    def _on_history_mode_changed(self, _text: str):
+        self.result.clear()
+        self._refresh_history()
+
+    def _update_history_action_buttons(self):
+        in_recycle = hasattr(self, "history_mode") and self.history_mode.currentText() == "Recycle Bin"
+        has_sel = self._selected_history_ts() is not None
+        if hasattr(self, "btn_hist_delete"):
+            self.btn_hist_delete.setVisible(not in_recycle)
+            self.btn_hist_delete.setEnabled(has_sel and not in_recycle)
+        if hasattr(self, "btn_hist_restore"):
+            self.btn_hist_restore.setVisible(in_recycle)
+            self.btn_hist_restore.setEnabled(has_sel and in_recycle)
+        if hasattr(self, "btn_hist_hard_delete"):
+            self.btn_hist_hard_delete.setVisible(in_recycle)
+            self.btn_hist_hard_delete.setEnabled(has_sel and in_recycle)
+
+    def _delete_selected_history_scan(self):
+        ts = self._selected_history_ts()
+        if not ts:
+            return
+        if QMessageBox.question(self, "Delete Scan", f"Move scan {ts} to recycle bin?") != QMessageBox.Yes:
+            return
+        out = soft_delete_scan_by_ts(self.cfg, ts)
+        if out.get("deleted", 0):
+            self.result.clear()
+            self._set_status(f"Moved {ts} to recycle bin")
+            self._refresh_history()
+
+    def _restore_selected_history_scan(self):
+        ts = self._selected_history_ts()
+        if not ts:
+            return
+        out = restore_scan_by_ts(self.cfg, ts)
+        if out.get("restored", 0):
+            self.result.clear()
+            self._set_status(f"Restored {ts}")
+            self._refresh_history()
+
+    def _hard_delete_selected_history_scan(self):
+        ts = self._selected_history_ts()
+        if not ts:
+            return
+        if QMessageBox.question(self, "Hard Delete Scan", f"Permanently delete scan {ts} and its files?") != QMessageBox.Yes:
+            return
+        out = hard_delete_scan_by_ts(self.cfg, ts, delete_files=True)
+        if out.get("deleted", 0):
+            self.result.clear()
+            self._set_status(f"Hard deleted {ts}")
+            self._refresh_history()
 
     def closeEvent(self, event):
         if self.cap is not None:

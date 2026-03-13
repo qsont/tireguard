@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from pathlib import Path
+import json
 
 APP_NAME = "TireGuard"
 
@@ -18,6 +19,7 @@ class AppConfig:
     roi_path: Path = Path("data/roi.json")
     export_csv_path: Path = Path("data/results_export.csv")
     calibration_path: Path = Path("data/calibration.json")
+    settings_path: Path = Path("data/app_settings.json")
 
     cam_index: int | None = None
     width: int = 1280
@@ -33,6 +35,13 @@ class AppConfig:
     # preprocess
     clahe_clip: float = 2.0
     clahe_grid: int = 8
+
+    # tread depth policy (mm)
+    car_legal_min_depth_mm: float = 1.6
+    motorcycle_legal_min_depth_mm: float = 1.0
+    car_warning_band_mm: float = 0.4
+    motorcycle_warning_band_mm: float = 0.4
+    recycle_retention_days: int = 30
 
     def __post_init__(self):
         # normalize clahe_grid
@@ -50,6 +59,50 @@ class AppConfig:
                 self.clahe_grid = (8, 8)
         else:
             self.clahe_grid = (8, 8)
+
+        # Load persisted runtime settings (if present).
+        self.load_runtime_settings()
+
+    def load_runtime_settings(self):
+        """Load persisted runtime settings from settings_path if available."""
+        p = Path(self.settings_path)
+        if not p.exists():
+            return
+        try:
+            payload = json.loads(p.read_text(encoding="utf-8"))
+        except Exception:
+            return
+        if not isinstance(payload, dict):
+            return
+
+        for key in (
+            "car_legal_min_depth_mm",
+            "motorcycle_legal_min_depth_mm",
+            "car_warning_band_mm",
+            "motorcycle_warning_band_mm",
+            "recycle_retention_days",
+        ):
+            if key in payload:
+                try:
+                    if key == "recycle_retention_days":
+                        setattr(self, key, int(payload[key]))
+                    else:
+                        setattr(self, key, float(payload[key]))
+                except Exception:
+                    continue
+
+    def save_runtime_settings(self):
+        """Persist runtime settings used by UI/API depth policy logic."""
+        p = Path(self.settings_path)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "car_legal_min_depth_mm": float(getattr(self, "car_legal_min_depth_mm", 1.6)),
+            "motorcycle_legal_min_depth_mm": float(getattr(self, "motorcycle_legal_min_depth_mm", 1.0)),
+            "car_warning_band_mm": float(getattr(self, "car_warning_band_mm", 0.4)),
+            "motorcycle_warning_band_mm": float(getattr(self, "motorcycle_warning_band_mm", 0.4)),
+            "recycle_retention_days": int(getattr(self, "recycle_retention_days", 30)),
+        }
+        p.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 def _normalize_clahe_grid(v, default=(8, 8)):
     try:

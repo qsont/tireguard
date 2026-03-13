@@ -18,9 +18,12 @@ fi
 
 DESKTOP_DIR="${TARGET_HOME}/Desktop"
 LAUNCHER_PATH="${DESKTOP_DIR}/TireGuard.desktop"
+LOG_DIR="${TARGET_HOME}/.local/state/tireguard"
+LOG_FILE="${LOG_DIR}/desktop.log"
 
 install_launcher() {
   mkdir -p "${DESKTOP_DIR}"
+  mkdir -p "${LOG_DIR}"
 
   cat > "${LAUNCHER_PATH}" <<EOF
 [Desktop Entry]
@@ -28,9 +31,10 @@ Type=Application
 Version=1.0
 Name=TireGuard
 Comment=Launch TireGuard scanner app (800x480 mode)
-Exec=/bin/bash -lc 'cd "${ROOT_DIR}" && ./scripts/rpi_run_800x480.sh'
+Exec=/bin/bash -lc 'cd "${ROOT_DIR}" && TIREGUARD_AUTO_SETUP=1 TIREGUARD_LOG_FILE="${LOG_FILE}" ./scripts/rpi_run_800x480.sh'
 Path=${ROOT_DIR}
 Terminal=false
+StartupNotify=false
 Categories=Utility;
 EOF
 
@@ -38,9 +42,11 @@ EOF
 
   if command -v chown >/dev/null 2>&1; then
     chown "${TARGET_USER}:${TARGET_USER}" "${LAUNCHER_PATH}" || true
+    chown "${TARGET_USER}:${TARGET_USER}" "${LOG_DIR}" "${LOG_FILE}" 2>/dev/null || true
   fi
 
   echo "Desktop launcher created: ${LAUNCHER_PATH}"
+  echo "Launcher logs: ${LOG_FILE}"
   echo "If Raspberry Pi asks to trust/allow launching, right-click the icon and choose 'Allow Launching'."
 }
 
