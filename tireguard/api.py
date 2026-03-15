@@ -20,6 +20,7 @@ except Exception:
 
 from .config import AppConfig
 from .calibration import load_calibration, score_to_depth_mm
+from .measure import apply_defect_guard, estimate_groove_channel_frac
 from .storage import (
     init_db,  # added
     list_results, get_result_by_ts, export_csv, find_processed_images,
@@ -71,6 +72,15 @@ def _tread_verdict_from_depth(cfg: AppConfig, depth_mm: float, vehicle_type: str
   return "GOOD"
 
 
+def _defect_guard_kwargs(cfg: AppConfig) -> dict[str, float]:
+  return {
+    "replace_channel_frac": float(getattr(cfg, "tread_guard_replace_channel_frac", 0.006)),
+    "warning_channel_frac": float(getattr(cfg, "tread_guard_warning_channel_frac", 0.018)),
+    "replace_score": float(getattr(cfg, "tread_guard_replace_score", 0.035)),
+    "warning_score": float(getattr(cfg, "tread_guard_warning_score", 0.065)),
+  }
+
+
 def _cfg():
     """
     Returns your app config. Falls back to AppConfig if load_config() is unavailable.
@@ -115,6 +125,41 @@ app.add_middleware(
 def health():
     """Health check endpoint."""
     return {"ok": True, "service": "tireguard-api"}
+
+
+@app.get("/api/tread-policy")
+def tread_policy():
+  cfg = _cfg()
+  return _jsonify({
+    "legal_min_mm": {
+      "car": _legal_min_depth_mm(cfg, "car"),
+      "motorcycle": _legal_min_depth_mm(cfg, "motorcycle"),
+    },
+    "warning_band_mm": {
+      "car": _warning_band_mm(cfg, "car"),
+      "motorcycle": _warning_band_mm(cfg, "motorcycle"),
+    },
+    "defect_guard": _defect_guard_kwargs(cfg),
+    "quality_policy": {
+      "min_brightness": float(getattr(cfg, "min_brightness", 40.0)),
+      "max_brightness": float(getattr(cfg, "max_brightness", 220.0)),
+      "max_glare_ratio": float(getattr(cfg, "max_glare_ratio", 0.06)),
+      "min_sharpness": float(getattr(cfg, "min_sharpness", 80.0)),
+      "relaxed_min_sharpness": float(getattr(cfg, "quality_relaxed_min_sharpness", 24.0)),
+      "relaxed_strong_score": float(getattr(cfg, "quality_relaxed_strong_score", 0.11)),
+      "relaxed_channel_frac": float(getattr(cfg, "quality_relaxed_channel_frac", 0.020)),
+      "relaxed_tread_confidence": float(getattr(cfg, "quality_relaxed_tread_confidence", 0.55)),
+    },
+    "automation": {
+      "auto_detect_tread_on_roi": bool(getattr(cfg, "auto_detect_tread_on_roi", True)),
+      "auto_calibrate_on_roi": bool(getattr(cfg, "auto_calibrate_on_roi", True)),
+      "auto_calibration_reference_mm": float(getattr(cfg, "auto_calibration_reference_mm", 120.0)),
+      "auto_calibration_reference_mm_car": float(getattr(cfg, "auto_calibration_reference_mm_car", 120.0)),
+      "auto_calibration_reference_mm_motorcycle": float(getattr(cfg, "auto_calibration_reference_mm_motorcycle", 85.0)),
+      "quick_session_auto_capture": bool(getattr(cfg, "quick_session_auto_capture", True)),
+      "quick_session_capture_cooldown_s": float(getattr(cfg, "quick_session_capture_cooldown_s", 1.8)),
+    },
+  })
 
 
 # ---------- Recent Scans ----------
@@ -375,9 +420,21 @@ def submit_validation(
     device_depth = score_to_depth_mm(device_score, calib=calib)
 
     vehicle_type = row.get("vehicle_type")
+    groove_proxy = estimate_groove_channel_frac(
+      score=device_score,
+      edge_density=row.get("edge_density"),
+      continuity=row.get("continuity"),
+    )
     min_mm = _legal_min_depth_mm(cfg, vehicle_type)
     manual_class = _tread_verdict_from_depth(cfg, float(manual_depth), vehicle_type)
     device_class = _tread_verdict_from_depth(cfg, float(device_depth), vehicle_type)
+    device_class = apply_defect_guard(
+      device_class,
+      groove_channel_frac=groove_proxy,
+      quality_ok=True,
+      score=device_score,
+      **_defect_guard_kwargs(cfg),
+    )
     class_match = (manual_class == device_class)
 
     abs_error = abs(device_depth - manual_depth)
@@ -401,7 +458,7 @@ def submit_validation(
         "notes": (
           f"Submitted via web dashboard | scan_ts={scan_ts} | vehicle_type={vehicle_type} | "
           f"legal_min={min_mm:.1f}mm | manual_class={manual_class} | device_class={device_class} | "
-          f"class_match={class_match}"
+          f"class_match={class_match} | groove_proxy={groove_proxy if groove_proxy is not None else 'n/a'}"
         ),
     })
 
@@ -416,6 +473,7 @@ def submit_validation(
         "legal_min_mm": min_mm,
         "manual_class": manual_class,
         "device_class": device_class,
+        "groove_channel_proxy": groove_proxy,
         "class_match": class_match,
         "verdict": verdict,
     }))
@@ -1489,6 +1547,10 @@ def index():
             <div class="info-value" id="selTreadVerdict">—</div>
           </div>
           <div class="info-item">
+            <div class="info-label">Capture Quality</div>
+            <div class="info-value" id="selQualityVerdict">—</div>
+          </div>
+          <div class="info-item">
             <div class="info-label">PSI Measured</div>
             <div class="info-value" id="selPsiMeasured">—</div>
           </div>
@@ -1715,6 +1777,7 @@ def index():
     function verdictClass(v) {
       v = (v || "").toUpperCase();
       if (v === "GOOD" || v === "OK") return "verdict-good";
+      if (v === "ADVISORY") return "verdict-warning";
       if (v === "WARNING" || v.includes("WARN")) return "verdict-warning";
       if (v === "REPLACE") return "verdict-replace";
       if (v === "PASS") return "verdict-pass";
@@ -1758,7 +1821,7 @@ def index():
     let lastFilteredScans = [];
 
     async function api(path) {
-      const res = await fetch(path);
+      const res = await fetch(path, { cache: "no-store" });
       if (!res.ok) throw new Error(await res.text());
       return res;
     }
@@ -1980,6 +2043,7 @@ def index():
           currentSelectedScanTs = null;
           $("selTs").textContent = "Select a scan from the list";
           $("selVerdict").textContent = "—";
+          $("selQualityVerdict").textContent = "—";
         }
         await loadScans();
         await loadValidation();
@@ -2040,6 +2104,7 @@ def index():
           currentSelectedScanTs = null;
           $("selTs").textContent = "Select a scan from the list";
           $("selVerdict").textContent = "—";
+          $("selQualityVerdict").textContent = "—";
         }
         await loadScans();
         await loadValidation();
@@ -2066,6 +2131,14 @@ def index():
         const payload = await res.json().catch(() => ({}));
         if (!res.ok) throw new Error(payload.detail || `Purge failed (${res.status})`);
         currentSelectedScanTs = null;
+
+        // After moving active data, switch to recycle bin so users can
+        // immediately verify where the records went.
+        if (!inRecycle) {
+          $("showRecycleBin").checked = true;
+          updateRecycleUi();
+        }
+
         await loadScans();
         await loadValidation();
         status(inRecycle
@@ -2105,6 +2178,7 @@ def index():
         $("selContinuity").textContent = nfmt(row.continuity, 2);
 
         const treadVerdict = row.tread_verdict || "—";
+        const qualityVerdict = row.quality_verdict || "—";
         const psiMeasured = (typeof row.psi_measured === "number")
           ? row.psi_measured.toFixed(1)
           : (row.psi_measured ?? "—");
@@ -2114,6 +2188,7 @@ def index():
         const psiStatus = row.psi_status || "—";
 
         $("selTreadVerdict").innerHTML = `<span class="verdict-badge ${verdictClass(treadVerdict)}">${treadVerdict}</span>`;
+        $("selQualityVerdict").innerHTML = `<span class="verdict-badge ${verdictClass(qualityVerdict)}">${qualityVerdict}</span>`;
         $("selPsiMeasured").textContent = psiMeasured;
         $("selPsiRecommended").textContent = psiRecommended;
         $("selPsiStatus").innerHTML = `<span class="verdict-badge ${verdictClass(psiStatus)}">${psiStatus}</span>`;

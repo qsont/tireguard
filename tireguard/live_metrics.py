@@ -26,7 +26,7 @@ def compute_stability(prev_gray: np.ndarray | None, gray: np.ndarray) -> float:
     Rough scene stability: mean absolute diff between frames (0..255).
     Lower = more stable.
     """
-    if prev_gray is None:
+    if prev_gray is None or prev_gray.shape != gray.shape:
         return 999.0
     diff = cv2.absdiff(prev_gray, gray)
     return float(np.mean(diff))

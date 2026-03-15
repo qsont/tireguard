@@ -59,11 +59,14 @@ for s in "${REQUIRED_SCRIPTS[@]}"; do
   check_file_exec "$s"
 done
 
-if bash -n "${REQUIRED_SCRIPTS[@]}"; then
-  ok "All required scripts pass bash syntax check"
-else
-  fail "One or more scripts failed bash syntax check"
-fi
+_syntax_ok=1
+for _script in "${REQUIRED_SCRIPTS[@]}"; do
+  if ! bash -n "$_script" 2>/dev/null; then
+    fail "Bash syntax error in: ${_script#"${ROOT_DIR}/"}"
+    _syntax_ok=0
+  fi
+done
+(( _syntax_ok )) && ok "All required scripts pass bash syntax check"
 
 section "App Layout"
 if [[ -f "${ROOT_DIR}/app.py" ]]; then
@@ -166,6 +169,14 @@ if compgen -G "/dev/video*" > /dev/null; then
   ok "Camera device nodes detected (/dev/video*)"
 else
   warn "No /dev/video* found (camera may be disconnected or permission-limited)"
+fi
+
+if [[ -n "$TARGET_USER" ]]; then
+  if id -nG "$TARGET_USER" 2>/dev/null | grep -qw "video"; then
+    ok "User '${TARGET_USER}' is in the 'video' group (camera access OK)"
+  else
+    warn "User '${TARGET_USER}' is NOT in 'video' group — camera may be denied. Run: sudo usermod -aG video ${TARGET_USER}"
+  fi
 fi
 
 echo ""

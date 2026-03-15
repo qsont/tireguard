@@ -50,6 +50,18 @@ if __name__ == "__main__":
     parser.add_argument("--simple-ui", action="store_true", help="Run simplified 800x480 touchscreen UI")
     parser.add_argument("--compact-ui", action="store_true", help="Force compact UI layout (recommended for 800x480 displays)")
     parser.add_argument("--rpi-ui", action="store_true", help="Raspberry Pi touchscreen preset (compact + fullscreen)")
+    parser.add_argument(
+        "--compact-video-ratio",
+        type=float,
+        default=None,
+        help="Compact UI video height ratio (0.20-0.80, default 0.40)",
+    )
+    parser.add_argument(
+        "--rpi-video-ratio",
+        type=float,
+        default=None,
+        help="Raspberry Pi UI video height ratio (0.20-0.80, default 0.38)",
+    )
     parser.add_argument("--no-browser", action="store_true", help="Do not auto-open dashboard")
     parser.add_argument("--host", default="0.0.0.0", help="Web host bind address")
     parser.add_argument("--port", type=int, default=8000, help="Web port")
@@ -75,6 +87,8 @@ if __name__ == "__main__":
             compact_ui=compact_override,
             fullscreen=bool(args.rpi_ui),
             rpi_ui=bool(args.rpi_ui),
+            compact_video_ratio=args.compact_video_ratio,
+            rpi_video_ratio=args.rpi_video_ratio,
         )
     finally:
         _stop_process(web_proc)

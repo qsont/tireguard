@@ -150,6 +150,7 @@ def init_db(cfg):
         ("raw_score_verdict", "TEXT"),
         # PSI + combined logic fields
         ("tread_verdict", "TEXT"),
+        ("quality_verdict", "TEXT"),
         ("psi_measured", "REAL"),
         ("psi_recommended", "REAL"),
         ("psi_status", "TEXT"),
@@ -333,7 +334,7 @@ def list_results(
             operator,
             brightness, sharpness, edge_density, continuity,
             psi_measured, psi_recommended, psi_status, tread_verdict,
-            device_depth_mm, raw_score_verdict, deleted_at
+            quality_verdict, device_depth_mm, raw_score_verdict, deleted_at
         FROM results
         {where_sql}
         ORDER BY id DESC
@@ -361,9 +362,10 @@ def list_results(
             "psi_recommended": r[15],
             "psi_status": r[16],
             "tread_verdict": r[17],
-            "device_depth_mm": r[18],
-            "raw_score_verdict": r[19],
-            "deleted_at": r[20],
+            "quality_verdict": r[18],
+            "device_depth_mm": r[19],
+            "raw_score_verdict": r[20],
+            "deleted_at": r[21],
         }
         for r in rows
     ]
@@ -378,7 +380,7 @@ def get_result_by_ts(cfg, ts: str, include_deleted: bool = False):
                edge_density,continuity,score,verdict,notes,
                vehicle_type,vehicle_id,tire_model_code,tire_position,tire_type,tread_design,
                operator,session_notes,mm_per_px,
-             tread_verdict,psi_measured,psi_recommended,psi_status,
+             tread_verdict,quality_verdict,psi_measured,psi_recommended,psi_status,
              device_depth_mm,raw_score_verdict,deleted_at
         FROM results
         WHERE ts=?
@@ -394,7 +396,7 @@ def get_result_by_ts(cfg, ts: str, include_deleted: bool = False):
             "edge_density","continuity","score","verdict","notes",
             "vehicle_type","vehicle_id","tire_model_code","tire_position","tire_type","tread_design",
             "operator","session_notes","mm_per_px",
-            "tread_verdict","psi_measured","psi_recommended","psi_status",
+            "tread_verdict","quality_verdict","psi_measured","psi_recommended","psi_status",
                 "device_depth_mm","raw_score_verdict","deleted_at"]
     return dict(zip(keys, row))
 
@@ -419,7 +421,7 @@ def export_csv(cfg, include_deleted: bool = False):
         "operator","session_notes",
         "brightness","glare_ratio","sharpness",
         "edge_density","continuity","score","verdict","tread_verdict",
-        "device_depth_mm","raw_score_verdict",
+        "quality_verdict","device_depth_mm","raw_score_verdict",
         "psi_measured","psi_recommended","psi_status",
         "mm_per_px","notes"
     ]

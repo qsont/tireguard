@@ -41,6 +41,29 @@ class AppConfig:
     motorcycle_legal_min_depth_mm: float = 1.0
     car_warning_band_mm: float = 0.4
     motorcycle_warning_band_mm: float = 0.4
+    # Tread defect guard thresholds.
+    # Lower groove-channel fraction means flatter/worn tread.
+    # REPLACE is stricter; WARNING remains broader to avoid over-replacing borderline wear.
+    tread_guard_replace_channel_frac: float = 0.006
+    tread_guard_warning_channel_frac: float = 0.018
+    # Fallback score thresholds when channel fraction is unavailable.
+    tread_guard_replace_score: float = 0.035
+    tread_guard_warning_score: float = 0.065
+    # Automatic behavior switches.
+    auto_detect_tread_on_roi: bool = True
+    auto_calibrate_on_roi: bool = True
+    # Assumed real-world width represented by ROI span for automatic 2-point calibration.
+    auto_calibration_reference_mm: float = 120.0
+    auto_calibration_reference_mm_car: float = 120.0
+    auto_calibration_reference_mm_motorcycle: float = 85.0
+    # Quick-session mode for hands-free scan/capture workflows.
+    quick_session_auto_capture: bool = False
+    quick_session_capture_cooldown_s: float = 1.8
+    # Relax blur-only warnings into advisories when tread evidence is strong.
+    quality_relaxed_min_sharpness: float = 24.0
+    quality_relaxed_strong_score: float = 0.11
+    quality_relaxed_channel_frac: float = 0.020
+    quality_relaxed_tread_confidence: float = 0.55
     recycle_retention_days: int = 30
 
     def __post_init__(self):
@@ -80,12 +103,29 @@ class AppConfig:
             "motorcycle_legal_min_depth_mm",
             "car_warning_band_mm",
             "motorcycle_warning_band_mm",
+            "tread_guard_replace_channel_frac",
+            "tread_guard_warning_channel_frac",
+            "tread_guard_replace_score",
+            "tread_guard_warning_score",
+            "auto_detect_tread_on_roi",
+            "auto_calibrate_on_roi",
+            "auto_calibration_reference_mm",
+            "auto_calibration_reference_mm_car",
+            "auto_calibration_reference_mm_motorcycle",
+            "quick_session_auto_capture",
+            "quick_session_capture_cooldown_s",
+            "quality_relaxed_min_sharpness",
+            "quality_relaxed_strong_score",
+            "quality_relaxed_channel_frac",
+            "quality_relaxed_tread_confidence",
             "recycle_retention_days",
         ):
             if key in payload:
                 try:
                     if key == "recycle_retention_days":
                         setattr(self, key, int(payload[key]))
+                    elif key in ("auto_detect_tread_on_roi", "auto_calibrate_on_roi", "quick_session_auto_capture"):
+                        setattr(self, key, bool(payload[key]))
                     else:
                         setattr(self, key, float(payload[key]))
                 except Exception:
@@ -100,6 +140,21 @@ class AppConfig:
             "motorcycle_legal_min_depth_mm": float(getattr(self, "motorcycle_legal_min_depth_mm", 1.0)),
             "car_warning_band_mm": float(getattr(self, "car_warning_band_mm", 0.4)),
             "motorcycle_warning_band_mm": float(getattr(self, "motorcycle_warning_band_mm", 0.4)),
+            "tread_guard_replace_channel_frac": float(getattr(self, "tread_guard_replace_channel_frac", 0.006)),
+            "tread_guard_warning_channel_frac": float(getattr(self, "tread_guard_warning_channel_frac", 0.018)),
+            "tread_guard_replace_score": float(getattr(self, "tread_guard_replace_score", 0.035)),
+            "tread_guard_warning_score": float(getattr(self, "tread_guard_warning_score", 0.065)),
+            "auto_detect_tread_on_roi": bool(getattr(self, "auto_detect_tread_on_roi", True)),
+            "auto_calibrate_on_roi": bool(getattr(self, "auto_calibrate_on_roi", True)),
+            "auto_calibration_reference_mm": float(getattr(self, "auto_calibration_reference_mm", 120.0)),
+            "auto_calibration_reference_mm_car": float(getattr(self, "auto_calibration_reference_mm_car", 120.0)),
+            "auto_calibration_reference_mm_motorcycle": float(getattr(self, "auto_calibration_reference_mm_motorcycle", 85.0)),
+            "quick_session_auto_capture": bool(getattr(self, "quick_session_auto_capture", False)),
+            "quick_session_capture_cooldown_s": float(getattr(self, "quick_session_capture_cooldown_s", 1.8)),
+            "quality_relaxed_min_sharpness": float(getattr(self, "quality_relaxed_min_sharpness", 24.0)),
+            "quality_relaxed_strong_score": float(getattr(self, "quality_relaxed_strong_score", 0.11)),
+            "quality_relaxed_channel_frac": float(getattr(self, "quality_relaxed_channel_frac", 0.020)),
+            "quality_relaxed_tread_confidence": float(getattr(self, "quality_relaxed_tread_confidence", 0.55)),
             "recycle_retention_days": int(getattr(self, "recycle_retention_days", 30)),
         }
         p.write_text(json.dumps(payload, indent=2), encoding="utf-8")

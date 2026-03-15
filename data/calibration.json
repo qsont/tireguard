@@ -1,5 +1,6 @@
 {
-  "px_per_mm": 30.524088847990203,
-  "mm_per_px": 0.032761010655551245,
-  "method": "two_point"
+  "px_per_mm": 4.2,
+  "mm_per_px": 0.23809523809523808,
+  "method": "auto_two_point_roi",
+  "auto_reference_mm": 120.0
 }

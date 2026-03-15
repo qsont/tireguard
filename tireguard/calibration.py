@@ -2,6 +2,22 @@ import json
 from pathlib import Path
 import math
 
+
+def has_score_model(calib: dict | None) -> bool:
+    """Return True when calibration includes a usable score->depth model."""
+    if not isinstance(calib, dict):
+        return False
+    model = calib.get("score_model")
+    if not isinstance(model, dict):
+        return False
+    mtype = str(model.get("type", "")).strip().lower()
+    if mtype == "linear":
+        return "slope" in model and "intercept" in model
+    if mtype == "poly":
+        coeffs = model.get("coeffs")
+        return isinstance(coeffs, list) and len(coeffs) > 0
+    return False
+
 def load_calibration(path: Path):
     if path.exists():
         return json.loads(path.read_text())

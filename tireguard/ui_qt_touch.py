@@ -1,5 +1,6 @@
 import json
 import sys
+import time
 from typing import Dict, Optional, Tuple
 
 import cv2
@@ -27,9 +28,16 @@ from PySide6.QtWidgets import (
 from .auto_roi import suggest_roi
 from .camera import open_camera
 from .preprocess import crop_roi, preprocess_bgr
-from .quality import run_quality_checks
-from .measure import groove_visibility_score, pass_fail_from_score
-from .calibration import load_calibration, score_to_depth_mm
+from .quality import run_quality_checks, assess_capture_quality
+from .measure import groove_visibility_score, pass_fail_from_score, apply_defect_guard, combine_tread_and_quality_verdicts
+from .calibration import (
+    load_calibration,
+    save_calibration,
+    compute_scale_from_two_points,
+    score_to_depth_mm,
+    has_score_model,
+)
+from .tread import detect_tread_design
 from .storage import (
     export_csv,
     find_processed_images,
@@ -204,6 +212,10 @@ class MainWindow(QMainWindow):
         self.psi_default_recommended = 32.0
         self.psi_good_delta = 1.5
         self.psi_warn_delta = 3.0
+        self.quick_session_auto_capture = bool(getattr(self.cfg, "quick_session_auto_capture", False))
+        self._quick_last_capture_t = 0.0
+        self._quick_capture_cooldown_s = float(getattr(self.cfg, "quick_session_capture_cooldown_s", 1.8))
+        self._capture_busy = False
 
         self.setWindowTitle("TireGuard - Simple 800x480")
         self.setFixedSize(800, 480)
@@ -263,6 +275,11 @@ class MainWindow(QMainWindow):
         title.setFont(QFont("Arial", 17, QFont.Bold))
         self.status = QLabel("Ready")
         self.status.setStyleSheet("color:#9fd9ff; font-weight:700; font-size:14px;")
+        self.quick_badge = QPushButton()
+        self.quick_badge.setCursor(Qt.PointingHandCursor)
+        self.quick_badge.setMinimumHeight(34)
+        self.quick_badge.clicked.connect(self._toggle_quick_session_badge)
+        self._refresh_quick_badge()
         self.btn_fullscreen = QPushButton("Fullscreen")
         self.btn_fullscreen.setMinimumHeight(40)
         self.btn_fullscreen.setStyleSheet(
@@ -271,6 +288,7 @@ class MainWindow(QMainWindow):
         self.btn_fullscreen.clicked.connect(self._toggle_fullscreen)
         top.addWidget(title)
         top.addStretch(1)
+        top.addWidget(self.quick_badge)
         top.addWidget(self.btn_fullscreen)
         top.addWidget(self.status)
         root.addLayout(top)
@@ -465,8 +483,12 @@ class MainWindow(QMainWindow):
         self.depth_car_warn_input.setValidator(self.depth_warn_validator)
         self.depth_moto_warn_input = QLineEdit(str(getattr(self.cfg, "motorcycle_warning_band_mm", DEFAULT_WARNING_BAND_MM["motorcycle"])))
         self.depth_moto_warn_input.setValidator(self.depth_warn_validator)
+        self.quick_session_input = QComboBox()
+        self.quick_session_input.addItems(["Off", "On"])
+        self.quick_session_input.setCurrentText("On" if self.quick_session_auto_capture else "Off")
         set_layout.addRow("Camera", self.cam_idx)
         set_layout.addRow("Resolution", self.res_combo)
+        set_layout.addRow("Quick Session", self.quick_session_input)
         set_layout.addRow("Default PSI", self.psi_default_input)
         set_layout.addRow("Good ±", self.psi_good_input)
         set_layout.addRow("Warn ±", self.psi_warn_input)
@@ -487,6 +509,7 @@ class MainWindow(QMainWindow):
         self.psi_default_input.textChanged.connect(self._update_psi_status_label)
         self.psi_good_input.textChanged.connect(self._update_psi_status_label)
         self.psi_warn_input.textChanged.connect(self._update_psi_status_label)
+        self.quick_session_input.currentTextChanged.connect(self._on_quick_session_changed)
         self.depth_car_warn_input.textChanged.connect(self._persist_depth_policy_settings)
         self.depth_moto_warn_input.textChanged.connect(self._persist_depth_policy_settings)
         self._update_roi_info()
@@ -506,6 +529,61 @@ class MainWindow(QMainWindow):
 
     def _set_status(self, text: str):
         self.status.setText(text)
+
+    def _on_quick_session_changed(self, text: str):
+        enabled = (text.strip().lower() == "on")
+        self.quick_session_auto_capture = enabled
+        self.cfg.quick_session_auto_capture = enabled
+        try:
+            self.cfg.save_runtime_settings()
+        except Exception as e:
+            print(f"[WARN] Could not persist quick session setting: {e}")
+        self._refresh_quick_badge()
+        self._set_status("Quick Session ON" if enabled else "Quick Session OFF")
+
+    def _toggle_quick_session_badge(self):
+        if not hasattr(self, "quick_session_input"):
+            return
+        enabled = bool(getattr(self.cfg, "quick_session_auto_capture", False))
+        self.quick_session_input.setCurrentText("Off" if enabled else "On")
+
+    def _refresh_quick_badge(self):
+        enabled = bool(getattr(self.cfg, "quick_session_auto_capture", False))
+        if not hasattr(self, "quick_badge"):
+            return
+        if not enabled:
+            self.quick_badge.setText("QUICK OFF")
+            self.quick_badge.setStyleSheet(
+                "QPushButton { background:#4b5563; color:#f4f7fb; padding:4px 10px; border-radius:10px; font-weight:700; font-size:12px; border: 1px solid #697586; }"
+                "QPushButton:hover { background:#5a6574; }"
+            )
+            return
+        if self._capture_busy:
+            text = "QUICK CAPTURING"
+            style = (
+                "QPushButton { background:#8a5a16; color:#fff7e8; padding:4px 10px; border-radius:10px; font-weight:700; font-size:12px; border: 1px solid #bf7a1c; }"
+                "QPushButton:hover { background:#9c6818; }"
+            )
+        elif self.roi and self.scan_step and self.video.ok_hint and self.auto_trigger_enabled:
+            text = "QUICK ARMED"
+            style = (
+                "QPushButton { background:#17603f; color:#ecfff5; padding:4px 10px; border-radius:10px; font-weight:700; font-size:12px; border: 1px solid #23945f; }"
+                "QPushButton:hover { background:#1a714a; }"
+            )
+        elif self.roi:
+            text = "QUICK READY"
+            style = (
+                "QPushButton { background:#14507a; color:#ebf7ff; padding:4px 10px; border-radius:10px; font-weight:700; font-size:12px; border: 1px solid #2478b5; }"
+                "QPushButton:hover { background:#17608f; }"
+            )
+        else:
+            text = "QUICK IDLE"
+            style = (
+                "QPushButton { background:#1f6f43; color:#eafff2; padding:4px 10px; border-radius:10px; font-weight:700; font-size:12px; border: 1px solid #2a8a58; }"
+                "QPushButton:hover { background:#25824e; }"
+            )
+        self.quick_badge.setText(text)
+        self.quick_badge.setStyleSheet(style)
 
     def _sync_fullscreen_button(self):
         if not hasattr(self, "btn_fullscreen"):
@@ -613,6 +691,9 @@ class MainWindow(QMainWindow):
         except Exception:
             return score_to_depth_mm(float(score), calib=None)
 
+    def _has_score_model(self) -> bool:
+        return has_score_model(self.calib)
+
     def _legal_min_depth_mm(self, vehicle_type: Optional[str]) -> float:
         v = (vehicle_type or "car").strip().lower()
         if v == "car":
@@ -634,6 +715,20 @@ class MainWindow(QMainWindow):
         if v == "motorcycle":
             return float(getattr(self.cfg, "motorcycle_warning_band_mm", DEFAULT_WARNING_BAND_MM["motorcycle"]))
         return DEFAULT_WARNING_BAND_MM["car"]
+
+    def _auto_calibration_reference_mm_for_vehicle(self) -> float:
+        vehicle_type = (self.in_vehicle_type.currentText() if hasattr(self, "in_vehicle_type") else "Car").strip().lower()
+        if vehicle_type == "motorcycle":
+            return float(getattr(self.cfg, "auto_calibration_reference_mm_motorcycle", 85.0))
+        return float(getattr(self.cfg, "auto_calibration_reference_mm_car", getattr(self.cfg, "auto_calibration_reference_mm", 120.0)))
+
+    def _defect_guard_kwargs(self) -> dict[str, float]:
+        return {
+            "replace_channel_frac": float(getattr(self.cfg, "tread_guard_replace_channel_frac", 0.006)),
+            "warning_channel_frac": float(getattr(self.cfg, "tread_guard_warning_channel_frac", 0.018)),
+            "replace_score": float(getattr(self.cfg, "tread_guard_replace_score", 0.035)),
+            "warning_score": float(getattr(self.cfg, "tread_guard_warning_score", 0.065)),
+        }
 
     def _persist_depth_policy_settings(self, *_):
         car_v = self._to_float_or_none(self.depth_car_warn_input.text()) if hasattr(self, "depth_car_warn_input") else None
@@ -756,6 +851,9 @@ class MainWindow(QMainWindow):
         else:
             self.in_tire.addItems(["FL", "FR", "RL", "RR", "SPARE"])
         self._refresh_depth_policy_info()
+        if self.roi and bool(getattr(self.cfg, "auto_calibrate_on_roi", True)):
+            self._auto_calibrate_from_roi()
+            self._update_roi_info()
 
     def _get_psi_settings(self) -> Tuple[float, float, float]:
         good = self._to_float_or_none(self.psi_good_input.text()) if hasattr(self, "psi_good_input") else None
@@ -800,6 +898,12 @@ class MainWindow(QMainWindow):
         if not ok or frame is None:
             return
         self.video.set_frame(frame, roi=self.roi)
+        self._refresh_quick_badge()
+        if self.quick_session_auto_capture and self.roi and not self._capture_busy:
+            now = time.monotonic()
+            if (now - self._quick_last_capture_t) >= self._quick_capture_cooldown_s:
+                self._quick_last_capture_t = now
+                self._capture_analyze(auto_mode=True)
 
     def _toggle_roi_mode(self):
         enabled = not self.video.roi_mode
@@ -815,6 +919,7 @@ class MainWindow(QMainWindow):
         self.video.set_roi_mode(False)
         self.btn_roi.setText("Set ROI")
         self._set_status(f"ROI set {self.roi['w']}x{self.roi['h']}")
+        self._auto_post_roi_update("drag")
 
     def _clear_roi(self):
         self.roi = None
@@ -822,6 +927,7 @@ class MainWindow(QMainWindow):
         self.video.update()
         self.btn_roi.setText("Set ROI")
         self._update_roi_info()
+        self._refresh_quick_badge()
         self._set_status("ROI cleared")
 
     def _auto_roi(self):
@@ -832,137 +938,270 @@ class MainWindow(QMainWindow):
             self.roi = suggest_roi(self.video.frame_bgr)
             self._save_roi()
             self._set_status(f"Auto ROI set {self.roi['w']}x{self.roi['h']}")
+            self._auto_post_roi_update("auto")
         except Exception as exc:
             self._set_status(f"Auto ROI failed: {exc}")
 
-    def _capture_analyze(self):
-        if self.video.frame_bgr is None:
-            self._set_status("No frame to capture")
-            return
-        if not self.roi:
-            QMessageBox.warning(self, "ROI Required", "Set ROI first.")
-            return
-
-        vehicle = self.in_vehicle.text().strip()
-        operator = self.in_operator.text().strip()
-        psi_measured = self._to_float_or_none(self.in_psi_measured.text())
-        psi_recommended = self._to_float_or_none(self.in_psi_recommended.text())
-        if not vehicle or not operator or psi_measured is None or psi_recommended is None:
-            QMessageBox.warning(
-                self,
-                "Missing Session Data",
-                "Please fill Vehicle, Operator, PSI Measured, and PSI Recommended before capture.",
+    def _auto_detect_tread_design_from_roi(self) -> tuple[str | None, dict | None]:
+        if not bool(getattr(self.cfg, "auto_detect_tread_on_roi", True)):
+            return None, None
+        if self.video.frame_bgr is None or not self.roi:
+            return None, None
+        try:
+            roi_bgr = crop_roi(self.video.frame_bgr, self.roi)
+            raw_gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+            processed = preprocess_bgr(
+                roi_bgr,
+                clahe_clip=float(getattr(self.cfg, "clahe_clip", 2.0)),
+                clahe_grid=getattr(self.cfg, "clahe_grid", (8, 8)),
             )
+            edges = processed.get("edges_closed", processed.get("edges"))
+            detected_tread_design, tread_detect_meta = detect_tread_design(gray=raw_gray, edges=edges)
+            if self.in_tread_design.findText(detected_tread_design) >= 0:
+                self.in_tread_design.setCurrentText(detected_tread_design)
+            return detected_tread_design, tread_detect_meta
+        except Exception as exc:
+            self._set_status(f"Auto tread detect failed: {exc}")
+            return None, None
+
+    def _auto_calibrate_from_roi(self) -> bool:
+        if not bool(getattr(self.cfg, "auto_calibrate_on_roi", True)):
+            return False
+        if self.video.frame_bgr is None or not self.roi:
+            return False
+        try:
+            known_mm = self._auto_calibration_reference_mm_for_vehicle()
+            if known_mm <= 0.0:
+                return False
+            x = int(self.roi["x"])
+            y = int(self.roi["y"])
+            w = int(self.roi["w"])
+            h = int(self.roi["h"])
+            p0 = (x + int(0.10 * w), y + int(0.50 * h))
+            p1 = (x + int(0.90 * w), y + int(0.50 * h))
+            px_per_mm, mm_per_px = compute_scale_from_two_points(p0, p1, known_mm)
+            calib = dict(self.calib or {})
+            calib.update({
+                "px_per_mm": px_per_mm,
+                "mm_per_px": mm_per_px,
+                "method": "auto_two_point_roi",
+                "auto_reference_mm": known_mm,
+            })
+            self.calib = calib
+            save_calibration(self.cfg.calibration_path, self.calib)
+            self._update_roi_info()
+            return True
+        except Exception as exc:
+            self._set_status(f"Auto calibration failed: {exc}")
+            return False
+
+    def _auto_post_roi_update(self, source: str):
+        detected_tread_design, tread_detect_meta = self._auto_detect_tread_design_from_roi()
+        calibrated = self._auto_calibrate_from_roi()
+        parts = []
+        if detected_tread_design:
+            conf = float((tread_detect_meta or {}).get("confidence", 0.0))
+            parts.append(f"tread={detected_tread_design} ({conf:.2f})")
+        if calibrated:
+            parts.append("calibration=updated")
+        if parts:
+            self._set_status(f"Auto {source} ROI: " + " | ".join(parts))
+        self._refresh_quick_badge()
+        if self.quick_session_auto_capture and not self._capture_busy:
+            now = time.monotonic()
+            if (now - self._quick_last_capture_t) >= self._quick_capture_cooldown_s:
+                self._quick_last_capture_t = now
+                self._capture_analyze(auto_mode=True)
+
+    def _capture_analyze(self, auto_mode: bool = False):
+        if self._capture_busy:
             return
+        self._capture_busy = True
+        self._refresh_quick_badge()
+        try:
+            if self.video.frame_bgr is None:
+                self._set_status("No frame to capture")
+                return
+            if not self.roi:
+                if not auto_mode:
+                    QMessageBox.warning(self, "ROI Required", "Set ROI first.")
+                return
 
-        frame = self.video.frame_bgr.copy()
-        roi_bgr = crop_roi(frame, self.roi)
+            vehicle = self.in_vehicle.text().strip() or "AUTO"
+            operator = self.in_operator.text().strip() or ("AUTO" if auto_mode else "")
+            psi_measured = self._to_float_or_none(self.in_psi_measured.text())
+            psi_recommended = self._to_float_or_none(self.in_psi_recommended.text())
+            if auto_mode:
+                if psi_recommended is None:
+                    psi_recommended = self.psi_default_recommended
+                if psi_measured is None:
+                    psi_measured = psi_recommended
+            elif not vehicle or not operator or psi_measured is None or psi_recommended is None:
+                QMessageBox.warning(
+                    self,
+                    "Missing Session Data",
+                    "Please fill Vehicle, Operator, PSI Measured, and PSI Recommended before capture.",
+                )
+                return
 
-        processed = preprocess_bgr(
-            roi_bgr,
-            clahe_clip=getattr(self.cfg, "clahe_clip", 2.0),
-            clahe_grid=getattr(self.cfg, "clahe_grid", (8, 8)),
-        )
-        q = run_quality_checks(processed["gray"], self.cfg)
-        edges = processed.get("edges_closed", processed.get("edges"))
-        m = groove_visibility_score(edges)
-        raw_score_verdict = pass_fail_from_score(float(m["score"]))
-        device_depth = self._score_to_depth_mm(float(m["score"]))
-        vehicle_type = self.in_vehicle_type.currentText()
-        tread_verdict = self._tread_verdict_from_depth(device_depth, vehicle_type)
-        psi_status = self._psi_verdict(psi_measured, psi_recommended)
-        verdict = tread_verdict
-        if psi_status.startswith("CRITICAL"):
-            verdict = "REPLACE"
+            frame = self.video.frame_bgr.copy()
+            roi_bgr = crop_roi(frame, self.roi)
 
-        meta = {
-            "camera_index": self.cam_index,
-            "roi": self.roi,
-            "quality": q,
-            "measure": m,
-            "verdict": verdict,
-            "session": {
-                "vehicle_type": self.in_vehicle_type.currentText(),
-                "vehicle_id": vehicle or None,
-                "tire_model_code": self.in_tire_model.text().strip() or None,
-                "tire_position": self.in_tire.currentText(),
-                "tire_type": self.in_tire_type.currentText() if self.in_tire_type.currentText() != "— Select —" else None,
-                "tread_design": self.in_tread_design.currentText() if self.in_tread_design.currentText() != "— Select —" else None,
-                "operator": operator or None,
-                "psi_measured": psi_measured,
-                "psi_recommended": psi_recommended,
-                "psi_status": psi_status,
-                "psi_good_delta": self._get_psi_settings()[0],
-                "psi_warn_delta": self._get_psi_settings()[1],
-                "session_notes": self.in_notes.text().strip() or None,
-            },
-        }
+            raw_gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+            processed = preprocess_bgr(
+                roi_bgr,
+                clahe_clip=getattr(self.cfg, "clahe_clip", 2.0),
+                clahe_grid=getattr(self.cfg, "clahe_grid", (8, 8)),
+            )
+            edges = processed.get("edges_closed", processed.get("edges"))
+            mm_per_px = self.calib.get("mm_per_px") if isinstance(self.calib, dict) else None
+            m = groove_visibility_score(edges, raw_gray=raw_gray, mm_per_px=mm_per_px)
+            detected_tread_design, tread_detect_meta = detect_tread_design(gray=raw_gray, edges=edges)
+            q = assess_capture_quality(
+                processed["gray"],
+                self.cfg,
+                score=float(m["score"]),
+                groove_channel_frac=m.get("groove_channel_frac"),
+                tread_detect_meta=tread_detect_meta,
+            )
+            quality_verdict = q.get("verdict", "OK")
+            raw_score_verdict = pass_fail_from_score(
+                float(m["score"]),
+                groove_channel_frac=m.get("groove_channel_frac"),
+                quality_ok=True,
+                **self._defect_guard_kwargs(),
+            )
+            has_depth_model = self._has_score_model()
+            device_depth = self._score_to_depth_mm(float(m["score"])) if has_depth_model else None
+            vehicle_type = self.in_vehicle_type.currentText()
+            tread_verdict = self._tread_verdict_from_depth(device_depth, vehicle_type) if has_depth_model else raw_score_verdict
+            tread_verdict = apply_defect_guard(
+                tread_verdict,
+                groove_channel_frac=m.get("groove_channel_frac"),
+                quality_ok=True,
+                score=float(m["score"]),
+                **self._defect_guard_kwargs(),
+            )
+            psi_status = self._psi_verdict(psi_measured, psi_recommended)
+            verdict = combine_tread_and_quality_verdicts(tread_verdict, quality_verdict)
+            if psi_status.startswith("CRITICAL"):
+                verdict = "REPLACE"
 
-        ts, img_path, _ = save_capture(self.cfg, frame, meta)
-        save_processed(self.cfg, ts, processed)
+            if self.in_tread_design.findText(detected_tread_design) >= 0:
+                self.in_tread_design.setCurrentText(detected_tread_design)
 
-        insert_result(
-            self.cfg,
-            {
-                "ts": ts,
-                "image_path": str(img_path),
-                "roi_x": int(self.roi["x"]),
-                "roi_y": int(self.roi["y"]),
-                "roi_w": int(self.roi["w"]),
-                "roi_h": int(self.roi["h"]),
-                "brightness": float(q["metrics"]["brightness"]),
-                "glare_ratio": float(q["metrics"]["glare_ratio"]),
-                "sharpness": float(q["metrics"]["sharpness"]),
-                "edge_density": float(m["edge_density"]),
-                "continuity": float(m["continuity"]),
-                "score": float(m["score"]),
-                "device_depth_mm": float(device_depth),
-                "raw_score_verdict": raw_score_verdict,
+            meta = {
+                "camera_index": self.cam_index,
+                "roi": self.roi,
+                "quality": q,
+                "measure": m,
                 "verdict": verdict,
-                "tread_verdict": tread_verdict,
-                "psi_measured": psi_measured,
-                "psi_recommended": psi_recommended,
-                "psi_status": psi_status,
-                "notes": (
-                    (("; ".join(q["reasons"]) + " | ") if not q["ok"] else "")
-                    + f"depth_mm={device_depth:.3f}; raw_score_verdict={raw_score_verdict}"
-                ),
-                "vehicle_type": self.in_vehicle_type.currentText(),
-                "vehicle_id": vehicle or None,
-                "tire_model_code": self.in_tire_model.text().strip() or None,
-                "tire_position": self.in_tire.currentText(),
-                "tire_type": self.in_tire_type.currentText() if self.in_tire_type.currentText() != "— Select —" else None,
-                "tread_design": self.in_tread_design.currentText() if self.in_tread_design.currentText() != "— Select —" else None,
-                "operator": operator or None,
-                "session_notes": self.in_notes.text().strip() or None,
-            },
-        )
+                "quality_verdict": quality_verdict,
+                "depth_calibrated": has_depth_model,
+                "session": {
+                    "vehicle_type": self.in_vehicle_type.currentText(),
+                    "vehicle_id": vehicle or None,
+                    "tire_model_code": self.in_tire_model.text().strip() or None,
+                    "tire_position": self.in_tire.currentText(),
+                    "tire_type": self.in_tire_type.currentText() if self.in_tire_type.currentText() != "— Select —" else None,
+                    "tread_design": detected_tread_design,
+                    "operator": operator or None,
+                    "psi_measured": psi_measured,
+                    "psi_recommended": psi_recommended,
+                    "psi_status": psi_status,
+                    "psi_good_delta": self._get_psi_settings()[0],
+                    "psi_warn_delta": self._get_psi_settings()[1],
+                    "session_notes": self.in_notes.text().strip() or None,
+                },
+                "tread_detect": tread_detect_meta,
+            }
 
-        self.result.setPlainText(
-            f"TS: {ts}\n"
-            f"Vehicle Type: {self.in_vehicle_type.currentText()}\n"
-            f"Vehicle: {vehicle or '-'}\n"
-            f"Tire Model: {self.in_tire_model.text().strip() or '-'}\n"
-            f"Tire: {self.in_tire.currentText()}\n"
-            f"Tire Type: {self.in_tire_type.currentText()}\n"
-            f"Tread Design: {self.in_tread_design.currentText()}\n"
-            f"Operator: {operator or '-'}\n"
-            f"PSI Measured: {psi_measured:.1f}\n"
-            f"PSI Recommended: {psi_recommended:.1f}\n"
-            f"PSI Status: {psi_status}\n"
-            f"Tread Verdict: {tread_verdict}\n"
-            f"Depth (calibrated): {device_depth:.3f} mm\n"
-            f"Score: {float(m['score']):.4f}\n"
-            f"Raw Score Verdict: {raw_score_verdict}\n"
-            f"Final Verdict: {verdict}\n"
-            f"Brightness: {float(q['metrics']['brightness']):.2f}\n"
-            f"Sharpness: {float(q['metrics']['sharpness']):.2f}\n"
-        )
-        self._last_scan_depth_mm = device_depth
-        self._last_scan_vehicle_type = vehicle_type
-        self._refresh_depth_policy_info()
-        self._set_status(f"Captured: {verdict}")
-        self._refresh_history()
+            ts, img_path, _ = save_capture(self.cfg, frame, meta)
+            save_processed(self.cfg, ts, processed)
+
+            insert_result(
+                self.cfg,
+                {
+                    "ts": ts,
+                    "image_path": str(img_path),
+                    "roi_x": int(self.roi["x"]),
+                    "roi_y": int(self.roi["y"]),
+                    "roi_w": int(self.roi["w"]),
+                    "roi_h": int(self.roi["h"]),
+                    "brightness": float(q["metrics"]["brightness"]),
+                    "glare_ratio": float(q["metrics"]["glare_ratio"]),
+                    "sharpness": float(q["metrics"]["sharpness"]),
+                    "edge_density": float(m["edge_density"]),
+                    "continuity": float(m["continuity"]),
+                    "score": float(m["score"]),
+                    "device_depth_mm": float(device_depth) if device_depth is not None else None,
+                    "raw_score_verdict": raw_score_verdict,
+                    "verdict": verdict,
+                    "tread_verdict": tread_verdict,
+                    "quality_verdict": quality_verdict,
+                    "psi_measured": psi_measured,
+                    "psi_recommended": psi_recommended,
+                    "psi_status": psi_status,
+                    "notes": (
+                        ((q.get("policy_note", "") + " | ") if q.get("policy_note") else "")
+                        + (("; ".join(q["reasons"]) + " | ") if q.get("reasons") else "")
+                        + (f"quality_verdict={quality_verdict} | ")
+                        + (
+                            f"depth_mm={device_depth:.3f}; raw_score_verdict={raw_score_verdict}"
+                            if device_depth is not None
+                            else f"depth_mm=UNCALIBRATED; raw_score_verdict={raw_score_verdict}"
+                        )
+                    ),
+                    "vehicle_type": self.in_vehicle_type.currentText(),
+                    "vehicle_id": vehicle or None,
+                    "tire_model_code": self.in_tire_model.text().strip() or None,
+                    "tire_position": self.in_tire.currentText(),
+                    "tire_type": self.in_tire_type.currentText() if self.in_tire_type.currentText() != "— Select —" else None,
+                    "tread_design": detected_tread_design,
+                    "operator": operator or None,
+                    "session_notes": self.in_notes.text().strip() or None,
+                },
+            )
+
+            depth_line = (
+                f"Depth (calibrated): {device_depth:.3f} mm\n"
+                if device_depth is not None
+                else "Depth (calibrated): unavailable (save a score calibration model)\n"
+            )
+            self.result.setPlainText(
+                f"TS: {ts}\n"
+                f"Vehicle Type: {self.in_vehicle_type.currentText()}\n"
+                f"Vehicle: {vehicle or '-'}\n"
+                f"Tire Model: {self.in_tire_model.text().strip() or '-'}\n"
+                f"Tire: {self.in_tire.currentText()}\n"
+                f"Tire Type: {self.in_tire_type.currentText()}\n"
+                f"Tread Design (auto): {detected_tread_design} "
+                f"(conf {float(tread_detect_meta.get('confidence', 0.0)):.2f})\n"
+                f"Operator: {operator or '-'}\n"
+                f"PSI Measured: {psi_measured:.1f}\n"
+                f"PSI Recommended: {psi_recommended:.1f}\n"
+                f"PSI Status: {psi_status}\n"
+                f"Tread Verdict: {tread_verdict}\n"
+                f"Capture Quality: {quality_verdict}\n"
+                f"{depth_line}"
+                f"Score: {float(m['score']):.4f}\n"
+                f"Raw Score Verdict: {raw_score_verdict}\n"
+                f"Final Verdict: {verdict}\n"
+                f"Brightness: {float(q['metrics']['brightness']):.2f}\n"
+                f"Sharpness: {float(q['metrics']['sharpness']):.2f}\n"
+                + (f"Quality Policy: {q['policy_note']}\n" if q.get('policy_note') else "")
+                + (f"Quality Notes: {'; '.join(q['reasons'])}\n" if q.get('reasons') else "")
+            )
+            self._last_scan_depth_mm = device_depth
+            self._last_scan_vehicle_type = vehicle_type
+            self._refresh_depth_policy_info()
+            mode_text = "AUTO" if auto_mode else "MANUAL"
+            self._set_status(f"Captured ({mode_text}): {verdict}")
+            self._refresh_history()
+            self._refresh_quick_badge()
+        finally:
+            self._capture_busy = False
+            self._refresh_quick_badge()
 
     def _export_csv(self):
         out = export_csv(self.cfg)
@@ -1002,6 +1241,7 @@ class MainWindow(QMainWindow):
             f"PSI Recommended: {row.get('psi_recommended') if row.get('psi_recommended') is not None else '-'}\n"
             f"PSI Status: {row.get('psi_status') or '-'}\n"
             f"Tread Verdict: {row.get('tread_verdict') or '-'}\n"
+            f"Capture Quality: {row.get('quality_verdict') or '-'}\n"
             f"Depth (calibrated): {row.get('device_depth_mm') if row.get('device_depth_mm') is not None else '-'}\n"
             f"Raw Score Verdict: {row.get('raw_score_verdict') or '-'}\n"
             f"Score: {float(row.get('score') or 0.0):.4f}\n"

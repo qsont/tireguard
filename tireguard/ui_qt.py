@@ -22,11 +22,12 @@ except Exception:
 from .config import APP_NAME, RES_PRESETS
 from .camera import open_camera
 from .preprocess import preprocess_bgr, crop_roi
-from .quality import run_quality_checks
-from .measure import groove_visibility_score, pass_fail_from_score
+from .quality import run_quality_checks, assess_capture_quality
+from .measure import groove_visibility_score, pass_fail_from_score, apply_defect_guard, combine_tread_and_quality_verdicts
 from .auto_roi import suggest_roi
+from .tread import detect_tread_design
 from .calibration import (
-    load_calibration, save_calibration, compute_scale_from_two_points, score_to_depth_mm
+    load_calibration, save_calibration, compute_scale_from_two_points, score_to_depth_mm, has_score_model
 )
 from .live_metrics import compute_live_metrics
 from .storage import (
@@ -55,6 +56,23 @@ DEFAULT_WARNING_BAND_MM = {
 PSI_DEFAULT_RECOMMENDED = 32.0
 PSI_GOOD_DELTA = 1.5
 PSI_WARN_DELTA = 3.0
+
+# Compact layout split ratios (video share of height).
+# Remaining height goes to the controls panel.
+COMPACT_VIDEO_RATIO = 0.40
+RPI_VIDEO_RATIO = 0.38
+RPI_ADVANCED_OPEN_RATIO = 0.45
+
+
+def _clamp_video_ratio(value: Optional[float], default: float) -> float:
+    """Clamp user-provided video ratio to safe UI bounds."""
+    if value is None:
+        return default
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        return default
+    return max(0.20, min(0.80, ratio))
 
 # ---------- Helper Functions ----------
 def bgr_to_qimage(bgr: np.ndarray) -> QImage:
@@ -312,10 +330,19 @@ class VideoWidget(QLabel):
 class MainWindow(QMainWindow):
     """TireGuard main UI with 4-step wizard workflow."""
     
-    def __init__(self, cfg, compact_ui: Optional[bool] = None, rpi_ui: bool = False):
+    def __init__(
+        self,
+        cfg,
+        compact_ui: Optional[bool] = None,
+        rpi_ui: bool = False,
+        compact_video_ratio: Optional[float] = None,
+        rpi_video_ratio: Optional[float] = None,
+    ):
         super().__init__()
         self.cfg = cfg
         self.rpi_ui = bool(rpi_ui)
+        self.compact_video_ratio = _clamp_video_ratio(compact_video_ratio, COMPACT_VIDEO_RATIO)
+        self.rpi_video_ratio = _clamp_video_ratio(rpi_video_ratio, RPI_VIDEO_RATIO)
         init_db(cfg)
         self.setWindowTitle(APP_NAME)
         self.screen_size = self._primary_screen_size()
@@ -341,13 +368,13 @@ class MainWindow(QMainWindow):
         # Live metrics state
         self.prev_roi_gray = None
         self.live_last = None
-        self.auto_trigger_enabled = False
+        self.auto_trigger_enabled = bool(getattr(self.cfg, "quick_session_auto_capture", False))
         self.stable_ok_frames = 0
         self._metrics_last_t = 0.0
         
         # Capture safety
         self._auto_last_capture_t = 0.0
-        self._auto_cooldown_s = 2.0
+        self._auto_cooldown_s = float(getattr(self.cfg, "quick_session_capture_cooldown_s", 1.8))
         self._capture_busy = False
         self._last_scan_depth_mm: Optional[float] = None
         self._last_scan_vehicle_type: Optional[str] = None
@@ -514,15 +541,29 @@ class MainWindow(QMainWindow):
                 padding: 6px 10px;
             }
         """
-        self.setStyleSheet(base + (compact_overrides if self.compact_ui else ""))
+        rpi_overrides = """
+            QScrollBar:vertical {
+                width: 16px;
+                margin: 4px 2px 4px 2px;
+            }
+            QScrollBar::handle:vertical {
+                min-height: 42px;
+                border-radius: 8px;
+            }
+        """
+        self.setStyleSheet(
+            base
+            + (compact_overrides if self.compact_ui else "")
+            + (rpi_overrides if self.rpi_ui else "")
+        )
 
     def _wrap_step_for_compact(self, page: QWidget) -> QWidget:
-        if not self.compact_ui:
-            return page
+        """Wrap wizard step pages in a scroll area to prevent cramped UI."""
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setWidget(page)
         return scroll
 
@@ -553,8 +594,14 @@ class MainWindow(QMainWindow):
         title_box.addWidget(subtitle)
         self.chip = StatusChip("READY")
         self.chip.set_state("ready", "READY")
+        self.quick_badge = QPushButton()
+        self.quick_badge.setCursor(Qt.PointingHandCursor)
+        self.quick_badge.setMinimumHeight(26)
+        self.quick_badge.clicked.connect(self._toggle_quick_session_badge)
+        self._refresh_quick_badge()
         top.addLayout(title_box)
         top.addStretch(1)
+        top.addWidget(self.quick_badge)
         top.addWidget(self.chip)
         
         # Main content: split video + wizard
@@ -562,7 +609,6 @@ class MainWindow(QMainWindow):
         self.video.setParent(self)
         if self.compact_ui:
             self.video.setMinimumSize(320, 200)
-            self.video.setMaximumHeight(220)
         self.steps = QStackedWidget()
         
         self.steps.addWidget(self._wrap_step_for_compact(self._step_camera()))
@@ -589,8 +635,8 @@ class MainWindow(QMainWindow):
         right_layout.addWidget(self.steps)
         right_layout.addLayout(nav)
         
-        right_content.setMinimumWidth(420)
-        right_content.setMaximumWidth(600)
+        right_content.setMinimumWidth(360)
+        right_content.setMaximumWidth(900)
         if self.compact_ui:
             right_content.setMinimumWidth(300)
             right_content.setMaximumWidth(16777215)
@@ -602,12 +648,19 @@ class MainWindow(QMainWindow):
         splitter.setChildrenCollapsible(False)
         splitter.setHandleWidth(6 if self.compact_ui else 8)
         if self.compact_ui:
-            splitter.setSizes([190, 290])
+            available_h = max(440, self.screen_size.height())
+            video_ratio = self.rpi_video_ratio if self.rpi_ui else self.compact_video_ratio
+            video_h = max(200, int(available_h * video_ratio))
+            panel_h = max(220, available_h - video_h)
+            splitter.setSizes([video_h, panel_h])
             splitter.setStretchFactor(0, 1)
             splitter.setStretchFactor(1, 2)
         else:
-            splitter.setSizes([800, 400])
-            splitter.setStretchFactor(0, 3)
+            available_w = max(1080, self.screen_size.width())
+            video_w = max(640, int(available_w * 0.64))
+            panel_w = max(360, available_w - video_w)
+            splitter.setSizes([video_w, panel_w])
+            splitter.setStretchFactor(0, 2)
             splitter.setStretchFactor(1, 1)
         
         self.video.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -837,7 +890,12 @@ class MainWindow(QMainWindow):
         self.sp_stable_need.setValue(8)
         self.cb_auto_trigger = QComboBox()
         self.cb_auto_trigger.addItems(["Off", "On"])
+        self.cb_auto_trigger.setCurrentText("On" if self.auto_trigger_enabled else "Off")
+        self.cb_quick_session = QComboBox()
+        self.cb_quick_session.addItems(["Off", "On"])
+        self.cb_quick_session.setCurrentText("On" if bool(getattr(self.cfg, "quick_session_auto_capture", False)) else "Off")
         fo.addRow("Burst frames", self.sp_burst)
+        fo.addRow("Quick Session", self.cb_quick_session)
         fo.addRow("Auto-trigger", self.cb_auto_trigger)
         fo.addRow("Stable frames needed", self.sp_stable_need)
         opt.setLayout(fo)
@@ -848,6 +906,7 @@ class MainWindow(QMainWindow):
         v.addWidget(self.btn_capture)
         
         self.cb_auto_trigger.currentTextChanged.connect(self._on_auto_trigger_changed)
+        self.cb_quick_session.currentTextChanged.connect(self._on_quick_session_changed)
         
         self.btn_export = QPushButton("Export CSV")
         self.btn_export.clicked.connect(self.export_csv_action)
@@ -873,8 +932,19 @@ class MainWindow(QMainWindow):
         """Build Advanced settings dock (removable panel)."""
         self.adv_dock = QDockWidget("Advanced Settings", self)
         self.adv_dock.setFeatures(QDockWidget.DockWidgetMovable | QDockWidget.DockWidgetFloatable)
-        self.addDockWidget(Qt.RightDockWidgetArea, self.adv_dock)
+        dock_area = Qt.BottomDockWidgetArea if self.rpi_ui else Qt.RightDockWidgetArea
+        self.addDockWidget(dock_area, self.adv_dock)
         self.adv_dock.setVisible(False)
+        if self.rpi_ui:
+            dock_min_h = max(200, int(self.screen_size.height() * 0.38))
+            self._rpi_adv_open_height = max(dock_min_h, int(self.screen_size.height() * RPI_ADVANCED_OPEN_RATIO))
+            self.adv_dock.setMinimumHeight(dock_min_h)
+            self.adv_dock.setMaximumHeight(max(dock_min_h + 80, int(self.screen_size.height() * 0.72)))
+        else:
+            dock_min_w = 300 if self.compact_ui else 340
+            self.adv_dock.setMinimumWidth(dock_min_w)
+            if not self.compact_ui:
+                self.adv_dock.setMaximumWidth(max(dock_min_w + 80, int(self.screen_size.width() * 0.45)))
         self.adv_dock.setStyleSheet("""
             QDockWidget {
                 background: rgba(12, 18, 28, 0.95);
@@ -1092,7 +1162,18 @@ class MainWindow(QMainWindow):
         v.addWidget(hist)
         v.addStretch(1)
         adv.setLayout(v)
-        self.adv_dock.setWidget(adv)
+
+        adv_scroll = QScrollArea()
+        adv_scroll.setWidgetResizable(True)
+        adv_scroll.setFrameShape(QFrame.NoFrame)
+        adv_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        adv_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        adv_scroll.setWidget(adv)
+
+        if QScroller is not None and (self.compact_ui or self.rpi_ui):
+            QScroller.grabGesture(adv_scroll.viewport(), QScroller.LeftMouseButtonGesture)
+
+        self.adv_dock.setWidget(adv_scroll)
 
     # ---------- Calibration Methods ----------
     def _save_linear_calibration(self):
@@ -1131,6 +1212,9 @@ class MainWindow(QMainWindow):
 
         return max(0.0, slope * score + intercept)
 
+    def _has_score_model(self) -> bool:
+        return has_score_model(self.calib)
+
     def _legal_min_depth_mm(self, vehicle_type: Optional[str]) -> float:
         v = (vehicle_type or "car").strip().lower()
         if v == "car":
@@ -1146,6 +1230,14 @@ class MainWindow(QMainWindow):
         if v == "motorcycle":
             return float(getattr(self.cfg, "motorcycle_warning_band_mm", DEFAULT_WARNING_BAND_MM["motorcycle"]))
         return DEFAULT_WARNING_BAND_MM["car"]
+
+    def _defect_guard_kwargs(self) -> dict[str, float]:
+        return {
+            "replace_channel_frac": float(getattr(self.cfg, "tread_guard_replace_channel_frac", 0.006)),
+            "warning_channel_frac": float(getattr(self.cfg, "tread_guard_warning_channel_frac", 0.018)),
+            "replace_score": float(getattr(self.cfg, "tread_guard_replace_score", 0.035)),
+            "warning_score": float(getattr(self.cfg, "tread_guard_warning_score", 0.065)),
+        }
 
     def _depth_policy_text(self, vehicle_type: Optional[str]) -> str:
         def chip(label: str) -> str:
@@ -1199,6 +1291,9 @@ class MainWindow(QMainWindow):
 
     def _run_validation_core(self) -> Tuple[float, float, str]:
         """Core validation pipeline. Returns (score, depth_mm, verdict)."""
+        if not self._has_score_model():
+            raise RuntimeError("Depth validation requires a saved score calibration model")
+
         frame = self.video.frame_bgr.copy()
         roi_bgr = crop_roi(frame, self.roi)
 
@@ -1220,9 +1315,16 @@ class MainWindow(QMainWindow):
         if edges_for_measure is None:
             raise RuntimeError("No edges found for measurement")
 
-        m = groove_visibility_score(edges_for_measure)
+        _mm_per_px = self.calib.get("mm_per_px") if isinstance(self.calib, dict) else None
+        _raw_gray_val = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+        m = groove_visibility_score(edges_for_measure, raw_gray=_raw_gray_val, mm_per_px=_mm_per_px)
         device_score = float(m["score"])
-        raw_verdict = pass_fail_from_score(device_score)
+        raw_verdict = pass_fail_from_score(
+            device_score,
+            groove_channel_frac=m.get("groove_channel_frac"),
+            quality_ok=True,
+            **self._defect_guard_kwargs(),
+        )
 
         # Convert to depth
         device_depth = self._score_to_depth_mm(device_score)
@@ -1230,6 +1332,13 @@ class MainWindow(QMainWindow):
         # Legal-threshold verdict based on calibrated depth and vehicle class.
         vehicle_type = self.in_vehicle_type.currentText() if hasattr(self, "in_vehicle_type") else "Car"
         legal_verdict = self._tread_verdict_from_depth(device_depth, vehicle_type)
+        legal_verdict = apply_defect_guard(
+            legal_verdict,
+            groove_channel_frac=m.get("groove_channel_frac"),
+            quality_ok=True,
+            score=device_score,
+            **self._defect_guard_kwargs(),
+        )
 
         return device_score, device_depth, legal_verdict
 
@@ -1409,6 +1518,7 @@ class MainWindow(QMainWindow):
                             "Hint: " + ("READY TO CAPTURE" if live.ok_hint else "Adjust angle/light/hold steady")
                         ]
                         self.aim_box.setPlainText("\n".join(msg))
+                        self._refresh_quick_badge()
                     
                     # Auto-trigger
                     if self.auto_trigger_enabled and self.steps.currentIndex() == 3:
@@ -1456,6 +1566,7 @@ class MainWindow(QMainWindow):
         self.roi = None
         self.video.roi = None
         self._update_roi_info()
+        self._refresh_quick_badge()
         self.toast.show_toast("ROI cleared")
 
     def auto_roi(self):
@@ -1467,6 +1578,7 @@ class MainWindow(QMainWindow):
             self.video.set_frame(self.video.frame_bgr, roi=self.roi)
             self._update_roi_info()
             self.toast.show_toast("✅ Auto ROI set")
+            self._auto_post_roi_update("auto")
         except Exception as e:
             self.toast.show_toast(f"Auto ROI failed: {e}")
 
@@ -1496,6 +1608,86 @@ class MainWindow(QMainWindow):
         self.video.set_modes(False, False)
         self._update_roi_info()
         self.toast.show_toast(f"✅ ROI set ({w}×{h})")
+        self._auto_post_roi_update("drag")
+
+    def _auto_detect_tread_design_from_roi(self) -> tuple[str | None, dict[str, float] | None]:
+        if not bool(getattr(self.cfg, "auto_detect_tread_on_roi", True)):
+            return None, None
+        if self.video.frame_bgr is None or not self.roi:
+            return None, None
+        try:
+            roi_bgr = crop_roi(self.video.frame_bgr, self.roi)
+            raw_gray = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+            processed = preprocess_bgr(
+                roi_bgr,
+                clahe_clip=float(getattr(self.cfg, "clahe_clip", 2.0)),
+                clahe_grid=getattr(self.cfg, "clahe_grid", (8, 8)),
+            )
+            edges = processed.get("edges_closed", processed.get("edges"))
+            detected_tread_design, tread_detect_meta = detect_tread_design(gray=raw_gray, edges=edges)
+            if hasattr(self, "in_tread_design") and self.in_tread_design.findText(detected_tread_design) >= 0:
+                self.in_tread_design.setCurrentText(detected_tread_design)
+            return detected_tread_design, tread_detect_meta
+        except Exception as exc:
+            self.toast.show_toast(f"Auto tread detect failed: {exc}")
+            return None, None
+
+    def _auto_calibrate_from_roi(self) -> bool:
+        if not bool(getattr(self.cfg, "auto_calibrate_on_roi", True)):
+            return False
+        if self.video.frame_bgr is None or not self.roi:
+            return False
+        try:
+            known_mm = self._auto_calibration_reference_mm_for_vehicle()
+            if known_mm <= 0.0:
+                return False
+            x = int(self.roi["x"])
+            y = int(self.roi["y"])
+            w = int(self.roi["w"])
+            h = int(self.roi["h"])
+            p0 = (x + int(0.10 * w), y + int(0.50 * h))
+            p1 = (x + int(0.90 * w), y + int(0.50 * h))
+            px_per_mm, mm_per_px = compute_scale_from_two_points(p0, p1, known_mm)
+            calib = dict(self.calib or {})
+            calib.update({
+                "px_per_mm": px_per_mm,
+                "mm_per_px": mm_per_px,
+                "method": "auto_two_point_roi",
+                "auto_reference_mm": known_mm,
+            })
+            self.calib = calib
+            save_calibration(self.cfg.calibration_path, self.calib)
+            self.cal_label.setText(self._calib_text())
+            self._update_roi_info()
+            return True
+        except Exception as exc:
+            self.toast.show_toast(f"Auto calibration failed: {exc}")
+            return False
+
+    def _auto_calibration_reference_mm_for_vehicle(self) -> float:
+        vehicle_type = (self.in_vehicle_type.currentText() if hasattr(self, "in_vehicle_type") else "Car").strip().lower()
+        if vehicle_type == "motorcycle":
+            return float(getattr(self.cfg, "auto_calibration_reference_mm_motorcycle", 85.0))
+        return float(getattr(self.cfg, "auto_calibration_reference_mm_car", getattr(self.cfg, "auto_calibration_reference_mm", 120.0)))
+
+    def _auto_post_roi_update(self, source: str):
+        detected_tread_design, tread_detect_meta = self._auto_detect_tread_design_from_roi()
+        calibrated = self._auto_calibrate_from_roi()
+        parts: list[str] = []
+        if detected_tread_design:
+            conf = float((tread_detect_meta or {}).get("confidence", 0.0))
+            parts.append(f"tread={detected_tread_design} ({conf:.2f})")
+        if calibrated:
+            parts.append("calibration=updated")
+        if parts:
+            self.toast.show_toast(f"Auto {source} ROI: " + " | ".join(parts))
+        self._refresh_quick_badge()
+
+        if bool(getattr(self.cfg, "quick_session_auto_capture", True)):
+            now = time.monotonic()
+            if not self._capture_busy and (now - self._auto_last_capture_t) >= self._auto_cooldown_s:
+                self._auto_last_capture_t = now
+                self.capture_analyze()
 
     # ---------- Calibration Management ----------
     def toggle_calibration(self):
@@ -1564,6 +1756,10 @@ class MainWindow(QMainWindow):
         else:
             self.in_tirepos.addItems(["FL", "FR", "RL", "RR", "SPARE"])
         self._refresh_depth_policy_info()
+        # Re-run auto calibration when vehicle type changes so reference width adapts.
+        if self.roi and bool(getattr(self.cfg, "auto_calibrate_on_roi", True)):
+            self._auto_calibrate_from_roi()
+            self._update_roi_info()
 
     def _to_float_or_none(self, text: str) -> Optional[float]:
         try:
@@ -1597,6 +1793,7 @@ class MainWindow(QMainWindow):
         if self._capture_busy:
             return
         self._capture_busy = True
+        self._refresh_quick_badge()
         try:
             if self.video.frame_bgr is None:
                 self.toast.show_toast("No camera frame.")
@@ -1660,25 +1857,56 @@ class MainWindow(QMainWindow):
                 self.toast.show_toast("Preprocess failed.")
                 return
 
-            # Quality
-            q = run_quality_checks(gray, self.cfg)
-
             # Measure
             edges_for_measure = processed.get("edges_closed", processed.get("edges"))
             if edges_for_measure is None:
                 self.toast.show_toast("No edges found.")
                 return
 
-            m = groove_visibility_score(edges_for_measure)
-            raw_score_verdict = pass_fail_from_score(m["score"])
-            device_depth = self._score_to_depth_mm(float(m["score"]))
+            _mm_per_px_cap = self.calib.get("mm_per_px") if isinstance(self.calib, dict) else None
+            _raw_gray_cap = cv2.cvtColor(roi_bgr, cv2.COLOR_BGR2GRAY)
+            m = groove_visibility_score(edges_for_measure, raw_gray=_raw_gray_cap, mm_per_px=_mm_per_px_cap)
+
+            detected_tread_design, tread_detect_meta = detect_tread_design(
+                gray=_raw_gray_cap,
+                edges=edges_for_measure,
+            )
+            if hasattr(self, "in_tread_design") and self.in_tread_design.findText(detected_tread_design) >= 0:
+                self.in_tread_design.setCurrentText(detected_tread_design)
+
+            q = assess_capture_quality(
+                gray,
+                self.cfg,
+                score=float(m["score"]),
+                groove_channel_frac=m.get("groove_channel_frac"),
+                tread_detect_meta=tread_detect_meta,
+            )
+            quality_verdict = q.get("verdict", "OK")
+            raw_score_verdict = pass_fail_from_score(
+                float(m["score"]),
+                groove_channel_frac=m.get("groove_channel_frac"),
+                quality_ok=True,
+                **self._defect_guard_kwargs(),
+            )
+            has_depth_model = self._has_score_model()
+            device_depth = self._score_to_depth_mm(float(m["score"])) if has_depth_model else None
             vehicle_type = self.in_vehicle_type.currentText() if hasattr(self, "in_vehicle_type") else "Car"
-            tread_verdict = self._tread_verdict_from_depth(device_depth, vehicle_type)
+            tread_verdict = self._tread_verdict_from_depth(device_depth, vehicle_type) if has_depth_model else raw_score_verdict
+            tread_verdict = apply_defect_guard(
+                tread_verdict,
+                groove_channel_frac=m.get("groove_channel_frac"),
+                quality_ok=True,
+                score=float(m["score"]),
+                **self._defect_guard_kwargs(),
+            )
 
             psi_measured = self._to_float_or_none(self.in_psi_measured.text()) if hasattr(self, "in_psi_measured") else None
             psi_recommended = self._to_float_or_none(self.in_psi_recommended.text()) if hasattr(self, "in_psi_recommended") else None
             psi_status = self._psi_verdict(psi_measured, psi_recommended)
-            verdict = self._combine_verdicts(tread_verdict, psi_status)
+            verdict = self._combine_verdicts(
+                combine_tread_and_quality_verdicts(tread_verdict, quality_verdict),
+                psi_status,
+            )
 
             # Save
             ts, img_path, _meta_path = save_capture(self.cfg, frame, {
@@ -1688,6 +1916,8 @@ class MainWindow(QMainWindow):
                 "measure": m,
                 "verdict": verdict,
                 "tread_verdict": tread_verdict,
+                "quality_verdict": quality_verdict,
+                "depth_calibrated": has_depth_model,
                 "psi": {
                     "measured": psi_measured,
                     "recommended": psi_recommended if psi_recommended is not None else PSI_DEFAULT_RECOMMENDED,
@@ -1699,10 +1929,11 @@ class MainWindow(QMainWindow):
                     "tire_model_code": self.in_tire_model.text().strip() or None,
                     "tire_position": self.in_tirepos.currentText().strip() or None,
                     "tire_type": self.in_tire_type.currentText() if hasattr(self, "in_tire_type") else None,
-                    "tread_design": self.in_tread_design.currentText() if hasattr(self, "in_tread_design") else None,
+                    "tread_design": detected_tread_design,
                     "operator": self.in_operator.text().strip() or None,
                     "notes": self.in_notes.text().strip() or None,
                 },
+                "tread_detect": tread_detect_meta,
                 "calibration": self.calib,
             })
             save_processed(self.cfg, ts, processed)
@@ -1710,7 +1941,6 @@ class MainWindow(QMainWindow):
             mm_per_px = self.calib.get("mm_per_px") if isinstance(self.calib, dict) else None
             _vtype = self.in_vehicle_type.currentText() if hasattr(self, "in_vehicle_type") else None
             _tire_type_val = self.in_tire_type.currentText() if hasattr(self, "in_tire_type") else None
-            _tread_val = self.in_tread_design.currentText() if hasattr(self, "in_tread_design") else None
             insert_result(self.cfg, {
                 "ts": ts,
                 "image_path": str(img_path),
@@ -1724,23 +1954,30 @@ class MainWindow(QMainWindow):
                 "edge_density": float(m["edge_density"]),
                 "continuity": float(m["continuity"]),
                 "score": float(m["score"]),
-                "device_depth_mm": float(device_depth),
+                "device_depth_mm": float(device_depth) if device_depth is not None else None,
                 "raw_score_verdict": raw_score_verdict,
                 "verdict": verdict,              # combined verdict
                 "tread_verdict": tread_verdict,  # depth-threshold tread verdict
+                "quality_verdict": quality_verdict,
                 "psi_measured": float(psi_measured) if psi_measured is not None else None,
                 "psi_recommended": float(psi_recommended) if psi_recommended is not None else PSI_DEFAULT_RECOMMENDED,
                 "psi_status": psi_status,
                 "notes": (
-                    (("; ".join(q["reasons"]) + " | ") if q.get("reasons") else "")
-                    + f"depth_mm={device_depth:.3f}; raw_score_verdict={raw_score_verdict}"
+                    ((q.get("policy_note", "") + " | ") if q.get("policy_note") else "")
+                    + (("; ".join(q["reasons"]) + " | ") if q.get("reasons") else "")
+                    + (f"quality_verdict={quality_verdict} | ")
+                    + (
+                        f"depth_mm={device_depth:.3f}; raw_score_verdict={raw_score_verdict}"
+                        if device_depth is not None
+                        else f"depth_mm=UNCALIBRATED; raw_score_verdict={raw_score_verdict}"
+                    )
                 ),
                 "vehicle_type": _vtype if _vtype and _vtype not in ("— Select —",) else None,
                 "vehicle_id": self.in_vehicle.text().strip() or None,
                 "tire_model_code": self.in_tire_model.text().strip() or None,
                 "tire_position": self.in_tirepos.currentText().strip() or None,
                 "tire_type": _tire_type_val if _tire_type_val and _tire_type_val != "— Select —" else None,
-                "tread_design": _tread_val if _tread_val and _tread_val != "— Select —" else None,
+                "tread_design": detected_tread_design,
                 "operator": self.in_operator.text().strip() or None,
                 "session_notes": self.in_notes.text().strip() or None,
                 "mm_per_px": float(mm_per_px) if mm_per_px else None,
@@ -1751,7 +1988,15 @@ class MainWindow(QMainWindow):
             self.result.append(f"<h3 style='margin:0;'>Scan: {verdict}</h3>")
             self.result.append(f"<b>TS:</b> {ts}")
             self.result.append(f"<b>Tread Verdict:</b> {tread_verdict}")
-            self.result.append(f"<b>Depth (calibrated):</b> {device_depth:.3f} mm")
+            self.result.append(f"<b>Capture Quality:</b> {quality_verdict}")
+            self.result.append(
+                f"<b>Tread Design (auto):</b> {detected_tread_design} "
+                f"(conf {float(tread_detect_meta.get('confidence', 0.0)):.2f})"
+            )
+            if device_depth is not None:
+                self.result.append(f"<b>Depth (calibrated):</b> {device_depth:.3f} mm")
+            else:
+                self.result.append("<b>Depth (calibrated):</b> unavailable (save a score calibration model)")
             if psi_measured is not None:
                 rec = psi_recommended if psi_recommended is not None else PSI_DEFAULT_RECOMMENDED
                 self.result.append(f"<b>PSI:</b> {psi_measured:.1f} (rec {rec:.1f}) → {psi_status}")
@@ -1762,6 +2007,8 @@ class MainWindow(QMainWindow):
             self.result.append(f"<b>Edge Density:</b> {float(m['edge_density']):.6f}")
             self.result.append(f"<b>Continuity:</b> {float(m['continuity']):.3f}")
             self.result.append(f"<b>Processing:</b> {proc_s:.3f} s")
+            if q.get("policy_note"):
+                self.result.append("<b>Quality Policy:</b> " + q["policy_note"])
             if q.get("reasons"):
                 self.result.append("<b>Quality Notes:</b> " + "; ".join(q["reasons"]))
 
@@ -1783,12 +2030,75 @@ class MainWindow(QMainWindow):
             self.chip.set_state("fail", "FAIL")
         finally:
             self._capture_busy = False
+            self._refresh_quick_badge()
 
     def _on_auto_trigger_changed(self, text: str):
         """Handle auto-trigger toggle."""
         self.auto_trigger_enabled = (text.strip().lower() == "on")
         self.stable_ok_frames = 0
         self.toast.show_toast("Auto-trigger ON" if self.auto_trigger_enabled else "Auto-trigger OFF")
+
+    def _on_quick_session_changed(self, text: str):
+        """Toggle quick automatic capture workflow."""
+        enabled = (text.strip().lower() == "on")
+        self.cfg.quick_session_auto_capture = enabled
+        self.auto_trigger_enabled = enabled
+        if hasattr(self, "cb_auto_trigger"):
+            wanted = "On" if enabled else "Off"
+            if self.cb_auto_trigger.currentText() != wanted:
+                self.cb_auto_trigger.setCurrentText(wanted)
+        try:
+            self.cfg.save_runtime_settings()
+        except Exception as e:
+            print(f"[WARN] Could not persist quick session setting: {e}")
+        self._refresh_quick_badge()
+        self.toast.show_toast("Quick Session ON" if enabled else "Quick Session OFF")
+
+    def _toggle_quick_session_badge(self):
+        if not hasattr(self, "cb_quick_session"):
+            return
+        enabled = bool(getattr(self.cfg, "quick_session_auto_capture", False))
+        self.cb_quick_session.setCurrentText("Off" if enabled else "On")
+
+    def _refresh_quick_badge(self):
+        enabled = bool(getattr(self.cfg, "quick_session_auto_capture", False))
+        if not hasattr(self, "quick_badge"):
+            return
+        if not enabled:
+            self.quick_badge.setText("QUICK OFF")
+            self.quick_badge.setStyleSheet(
+                "QPushButton { background:#4b5563; color:#f4f7fb; padding: 4px 10px; border-radius: 11px; font-weight: 700; font-size: 11px; border: 1px solid #697586; }"
+                "QPushButton:hover { background:#5a6574; }"
+            )
+            return
+
+        if self._capture_busy:
+            self.quick_badge.setText("QUICK CAPTURING")
+            self.quick_badge.setStyleSheet(
+                "QPushButton { background:#0f766e; color:#ecfeff; padding: 4px 10px; border-radius: 11px; font-weight: 700; font-size: 11px; border: 1px solid #14b8a6; }"
+                "QPushButton:hover { background:#0d8a80; }"
+            )
+            return
+
+        live_ok = bool(getattr(self.live_last, "ok_hint", False)) if self.live_last is not None else False
+        if self.roi and self.steps.currentIndex() == 3 and live_ok and self.auto_trigger_enabled:
+            self.quick_badge.setText("QUICK ARMED")
+            self.quick_badge.setStyleSheet(
+                "QPushButton { background:#1f6f43; color:#eafff2; padding: 4px 10px; border-radius: 11px; font-weight: 700; font-size: 11px; border: 1px solid #2a8a58; }"
+                "QPushButton:hover { background:#25824e; }"
+            )
+        elif self.roi:
+            self.quick_badge.setText("QUICK READY")
+            self.quick_badge.setStyleSheet(
+                "QPushButton { background:#7c5a10; color:#fff7db; padding: 4px 10px; border-radius: 11px; font-weight: 700; font-size: 11px; border: 1px solid #d4a017; }"
+                "QPushButton:hover { background:#916913; }"
+            )
+        else:
+            self.quick_badge.setText("QUICK IDLE")
+            self.quick_badge.setStyleSheet(
+                "QPushButton { background:#334155; color:#e2e8f0; padding: 4px 10px; border-radius: 11px; font-weight: 700; font-size: 11px; border: 1px solid #64748b; }"
+                "QPushButton:hover { background:#3c4c61; }"
+            )
 
     def export_csv_action(self):
         """Export results to CSV."""
@@ -1904,6 +2214,10 @@ class MainWindow(QMainWindow):
         vis = not self.adv_dock.isVisible()
         self.adv_dock.setVisible(vis)
         if vis:
+            if self.rpi_ui and not self.adv_dock.isFloating():
+                # Apply a predictable drawer height for RPi touch layout.
+                target_h = getattr(self, "_rpi_adv_open_height", int(self.screen_size.height() * RPI_ADVANCED_OPEN_RATIO))
+                QTimer.singleShot(0, lambda: self.resizeDocks([self.adv_dock], [target_h], Qt.Vertical))
             self._refresh_history()
 
 def run_app(
@@ -1911,10 +2225,18 @@ def run_app(
     compact_ui: Optional[bool] = None,
     fullscreen: bool = False,
     rpi_ui: bool = False,
+    compact_video_ratio: Optional[float] = None,
+    rpi_video_ratio: Optional[float] = None,
 ):
     """Launch the TireGuard application."""
     app = QApplication(sys.argv)
-    w = MainWindow(cfg, compact_ui=compact_ui, rpi_ui=rpi_ui)
+    w = MainWindow(
+        cfg,
+        compact_ui=compact_ui,
+        rpi_ui=rpi_ui,
+        compact_video_ratio=compact_video_ratio,
+        rpi_video_ratio=rpi_video_ratio,
+    )
     if fullscreen or rpi_ui:
         w.showFullScreen()
     else:

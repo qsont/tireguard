@@ -41,6 +41,28 @@ if [[ -n "${APT_INSTALL_CMD}" ]]; then
     libxcb-keysyms1 \
     libxcb-render-util0 \
     libxcb-xinerama0
+    # Camera support: v4l-utils lets you run 'v4l2-ctl --list-devices' to
+    # diagnose cameras; required for USB webcam & RPi Camera Module (V4L2 mode).
+    CAMERA_PKGS=(v4l-utils)
+    for _pkg in "${CAMERA_PKGS[@]}"; do
+      ${APT_INSTALL_CMD} install -y "$_pkg" 2>/dev/null || \
+        echo "Note: $_pkg not available — skipping (non-fatal)."
+    done
+
+    # Camera group: user must be in 'video' group to access /dev/video* devices.
+    SETUP_USER="${SUDO_USER:-${USER:-}}"
+    if [[ -n "${SETUP_USER}" && "${SETUP_USER}" != "root" ]]; then
+      if ! id -nG "${SETUP_USER}" 2>/dev/null | grep -qw "video"; then
+        if [[ "${EUID}" -eq 0 ]]; then
+          usermod -aG video "${SETUP_USER}"
+        elif command -v sudo >/dev/null 2>&1; then
+          sudo usermod -aG video "${SETUP_USER}"
+        fi
+        echo "Added '${SETUP_USER}' to the 'video' group. Log out and back in (or reboot) for camera access to take effect."
+      else
+        echo "User '${SETUP_USER}' already in 'video' group — camera access OK."
+      fi
+    fi
 else
   echo "[1/4] Skipping apt packages (apt-get not available on this system)."
 fi
@@ -71,3 +93,9 @@ echo ""
 echo "Setup complete."
 echo "Run the 800x480 app with: ./scripts/rpi_run_800x480.sh"
 echo "Reset dataset (keep DB file): ./scripts/rpi_reset_data.sh"
+echo ""
+echo "Camera setup tips:"
+echo "  - For USB webcam: plug in, then run  v4l2-ctl --list-devices  to verify it appears as /dev/video*"
+echo "  - For RPi Camera Module (CSI): run  sudo raspi-config > Interface Options > Camera  and reboot."
+echo "  - If /dev/video* is visible but permission denied, run:  sudo usermod -aG video \$USER  then reboot."
+echo "  - Run  ./scripts/rpi_healthcheck.sh  to verify the full installation."
