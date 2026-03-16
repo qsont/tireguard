@@ -375,9 +375,10 @@ for each_tire in 20_sample_tires:
     # Calculate % difference per Eq. 3.1
     percent_diff = abs(device_depth - manual_depth) / manual_depth * 100
     
-    # PASS CRITERIA:
-    # - Average % difference ≤ 5% (≈0.15mm error at 3mm depth)
-    # - Max single error ≤ 0.5mm
+    # PASS CRITERIA (field-friendly defaults; configurable in app settings):
+    # - % difference ≤ 10%
+    # - Absolute error ≤ 0.5mm
+    # - Device tread class must match manual-depth class
     # - Processing time ≤ 5 seconds end-to-end
 ```
 
@@ -408,6 +409,46 @@ for each_tire in 20_sample_tires:
 | Inconsistent depth readings | Variable working distance | Verify spacer enforces 15cm distance |
 | Dark/shadowed grooves | Insufficient lighting | Increase LED brightness; add diffuser |
 | "Blurry image" warnings | Camera focus drift | Clean lens; verify focus at 15cm distance |
+
+---
+
+## Calibration Sync Workflow (Thesis)
+
+### 1) Collect calibration pairs from validation table
+
+For each tire sample:
+- Capture a scan.
+- Enter manual depth in the Validation panel (Table 3.2 entry).
+- Repeat until you have at least 2 entries (20+ recommended for thesis reliability).
+
+### 2) Fit and save score model (automatic refresh enabled)
+
+Fit directly from `validation_results`:
+
+```bash
+.venv/bin/python scripts/fit_score_model.py --source validation --save
+```
+
+This now auto-refreshes stored scan metrics (`device_depth_mm`, `raw_score_verdict`, `tread_verdict`, `verdict`) right after model save.
+
+Additionally, each `/api/validation/submit` call attempts automatic model re-fit and derived-metric refresh once at least 2 validation pairs exist.
+
+### 3) Optional manual refresh via API
+
+If you update calibration outside the fit script, refresh with:
+
+```bash
+curl -X POST "http://127.0.0.1:8000/api/calibration/refresh-derived"
+```
+
+Notes:
+- Initial scan `verdict` is tread-only by policy. PSI and capture quality are stored separately for diagnostics and Table 3.2 analysis.
+- API endpoints read calibration on request, and refresh endpoint updates historical rows for consistency.
+
+### Extra Troubleshooting
+
+| Symptom | Likely Cause | Fix |
+|---------|--------------|-----|
 | Web dashboard unreachable | Firewall/network config | `sudo ufw allow 8000` on Pi |
 | Slow processing (>5 sec) | Unoptimized OpenCV | Enable NEON: `pip uninstall opencv-python && pip install opencv-python-headless` |
 

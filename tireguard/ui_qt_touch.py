@@ -1083,9 +1083,9 @@ class MainWindow(QMainWindow):
                 **self._defect_guard_kwargs(),
             )
             psi_status = self._psi_verdict(psi_measured, psi_recommended)
-            verdict = combine_tread_and_quality_verdicts(tread_verdict, quality_verdict)
-            if psi_status.startswith("CRITICAL"):
-                verdict = "REPLACE"
+            # Policy: scan verdict reflects tread condition only.
+            # PSI/quality are persisted as separate metrics for diagnostics and validation.
+            verdict = tread_verdict
 
             if self.in_tread_design.findText(detected_tread_design) >= 0:
                 self.in_tread_design.setCurrentText(detected_tread_design)

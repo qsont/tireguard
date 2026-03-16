@@ -1903,10 +1903,9 @@ class MainWindow(QMainWindow):
             psi_measured = self._to_float_or_none(self.in_psi_measured.text()) if hasattr(self, "in_psi_measured") else None
             psi_recommended = self._to_float_or_none(self.in_psi_recommended.text()) if hasattr(self, "in_psi_recommended") else None
             psi_status = self._psi_verdict(psi_measured, psi_recommended)
-            verdict = self._combine_verdicts(
-                combine_tread_and_quality_verdicts(tread_verdict, quality_verdict),
-                psi_status,
-            )
+            # Policy: scan verdict reflects tread condition only.
+            # PSI/quality are persisted separately for diagnostics and validation.
+            verdict = tread_verdict
 
             # Save
             ts, img_path, _meta_path = save_capture(self.cfg, frame, {

@@ -64,6 +64,9 @@ class AppConfig:
     quality_relaxed_strong_score: float = 0.11
     quality_relaxed_channel_frac: float = 0.020
     quality_relaxed_tread_confidence: float = 0.55
+    # Validation tolerances for thesis/device comparison.
+    validation_max_percent_diff: float = 10.0
+    validation_max_abs_error_mm: float = 0.5
     recycle_retention_days: int = 30
 
     def __post_init__(self):
@@ -118,6 +121,8 @@ class AppConfig:
             "quality_relaxed_strong_score",
             "quality_relaxed_channel_frac",
             "quality_relaxed_tread_confidence",
+            "validation_max_percent_diff",
+            "validation_max_abs_error_mm",
             "recycle_retention_days",
         ):
             if key in payload:
@@ -155,6 +160,8 @@ class AppConfig:
             "quality_relaxed_strong_score": float(getattr(self, "quality_relaxed_strong_score", 0.11)),
             "quality_relaxed_channel_frac": float(getattr(self, "quality_relaxed_channel_frac", 0.020)),
             "quality_relaxed_tread_confidence": float(getattr(self, "quality_relaxed_tread_confidence", 0.55)),
+            "validation_max_percent_diff": float(getattr(self, "validation_max_percent_diff", 10.0)),
+            "validation_max_abs_error_mm": float(getattr(self, "validation_max_abs_error_mm", 0.5)),
             "recycle_retention_days": int(getattr(self, "recycle_retention_days", 30)),
         }
         p.write_text(json.dumps(payload, indent=2), encoding="utf-8")

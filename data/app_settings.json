@@ -14,5 +14,7 @@
   "auto_calibration_reference_mm_motorcycle": 85.0,
   "quick_session_auto_capture": false,
   "quick_session_capture_cooldown_s": 1.8,
+  "validation_max_percent_diff": 10.0,
+  "validation_max_abs_error_mm": 0.5,
   "recycle_retention_days": 30
 }

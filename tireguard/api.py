@@ -4,8 +4,10 @@ from __future__ import annotations
 import mimetypes
 import argparse
 import time
+import sqlite3
 from pathlib import Path
 from typing import Any
+from statistics import mean
 
 from fastapi import FastAPI, HTTPException, Query, Form, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -19,8 +21,8 @@ except Exception:
     load_config = None  # type: ignore
 
 from .config import AppConfig
-from .calibration import load_calibration, score_to_depth_mm
-from .measure import apply_defect_guard, estimate_groove_channel_frac
+from .calibration import has_score_model, load_calibration, save_calibration, score_to_depth_mm
+from .measure import apply_defect_guard, estimate_groove_channel_frac, pass_fail_from_score
 from .storage import (
     init_db,  # added
     list_results, get_result_by_ts, export_csv, find_processed_images,
@@ -62,6 +64,14 @@ def _warning_band_mm(cfg: AppConfig, vehicle_type: str | None) -> float:
   return DEFAULT_WARNING_BAND_MM["car"]
 
 
+def _validation_max_percent_diff(cfg: AppConfig) -> float:
+  return max(0.0, float(getattr(cfg, "validation_max_percent_diff", 10.0)))
+
+
+def _validation_max_abs_error_mm(cfg: AppConfig) -> float:
+  return max(0.0, float(getattr(cfg, "validation_max_abs_error_mm", 0.5)))
+
+
 def _tread_verdict_from_depth(cfg: AppConfig, depth_mm: float, vehicle_type: str | None) -> str:
   min_mm = _legal_min_depth_mm(cfg, vehicle_type)
   warn_band = max(0.0, _warning_band_mm(cfg, vehicle_type))
@@ -78,6 +88,198 @@ def _defect_guard_kwargs(cfg: AppConfig) -> dict[str, float]:
     "warning_channel_frac": float(getattr(cfg, "tread_guard_warning_channel_frac", 0.018)),
     "replace_score": float(getattr(cfg, "tread_guard_replace_score", 0.035)),
     "warning_score": float(getattr(cfg, "tread_guard_warning_score", 0.065)),
+  }
+
+
+def _enrich_row_depth_and_raw_verdict(cfg: AppConfig, row: dict[str, Any], calib: dict | None = None) -> dict[str, Any]:
+  """Populate missing depth/raw verdict fields using the calibrated score model when possible."""
+  if not isinstance(row, dict):
+    return row
+
+  score = row.get("score")
+  if score is None:
+    return row
+
+  try:
+    score_f = float(score)
+  except Exception:
+    return row
+
+  c = calib if calib is not None else load_calibration(cfg.calibration_path)
+  depth_mm = None
+  if has_score_model(c):
+    depth_mm = score_to_depth_mm(score_f, calib=c)
+
+  if row.get("device_depth_mm") is None and depth_mm is not None:
+    row["device_depth_mm"] = float(depth_mm)
+
+  if not row.get("raw_score_verdict"):
+    vt = row.get("vehicle_type")
+    groove_proxy = estimate_groove_channel_frac(
+      score=score_f,
+      edge_density=row.get("edge_density"),
+      continuity=row.get("continuity"),
+    )
+    if depth_mm is not None:
+      base = _tread_verdict_from_depth(cfg, float(depth_mm), vt)
+    else:
+      base = pass_fail_from_score(
+        score_f,
+        groove_channel_frac=groove_proxy,
+        quality_ok=True,
+        **_defect_guard_kwargs(cfg),
+      )
+    row["raw_score_verdict"] = apply_defect_guard(
+      base,
+      groove_channel_frac=groove_proxy,
+      quality_ok=True,
+      score=score_f,
+      **_defect_guard_kwargs(cfg),
+    )
+  return row
+
+
+def _load_validation_pairs(cfg: AppConfig, include_deleted: bool = False) -> list[tuple[float, float]]:
+  con = sqlite3.connect(cfg.db_path)
+  con.row_factory = sqlite3.Row
+  cur = con.cursor()
+  deleted_sql = "" if include_deleted else "AND deleted_at IS NULL"
+  cur.execute(
+    f"""
+    SELECT manual_depth, device_score
+    FROM validation_results
+    WHERE manual_depth IS NOT NULL
+      AND device_score IS NOT NULL
+      {deleted_sql}
+    ORDER BY id ASC
+    """
+  )
+  rows = cur.fetchall()
+  con.close()
+
+  out: list[tuple[float, float]] = []
+  for row in rows:
+    try:
+      out.append((float(row["manual_depth"]), float(row["device_score"])))
+    except Exception:
+      continue
+  return out
+
+
+def _fit_linear_score_model(pairs: list[tuple[float, float]]) -> dict[str, float] | None:
+  if len(pairs) < 2:
+    return None
+
+  ys = [p[0] for p in pairs]  # manual depth
+  xs = [p[1] for p in pairs]  # device score
+  mx = mean(xs)
+  my = mean(ys)
+  den = sum((x - mx) ** 2 for x in xs)
+  if den == 0.0:
+    return None
+  slope = sum((x - mx) * (y - my) for y, x in pairs) / den
+  intercept = my - slope * mx
+
+  preds = [slope * x + intercept for x in xs]
+  abs_err = [abs(y - p) for y, p in zip(ys, preds)]
+  mae = sum(abs_err) / len(abs_err)
+  ss_res = sum((y - p) ** 2 for y, p in zip(ys, preds))
+  ss_tot = sum((y - my) ** 2 for y in ys)
+  r2 = 1.0 if ss_tot == 0.0 else 1.0 - (ss_res / ss_tot)
+  return {
+    "slope": float(slope),
+    "intercept": float(intercept),
+    "mae_mm": float(mae),
+    "r2": float(r2),
+    "sample_count": float(len(pairs)),
+  }
+
+
+def _refresh_derived_metrics_from_calibration(cfg: AppConfig, calib: dict, include_deleted: bool = False) -> tuple[int, int]:
+  con = sqlite3.connect(cfg.db_path)
+  con.row_factory = sqlite3.Row
+  cur = con.cursor()
+  deleted_sql = "" if include_deleted else "WHERE deleted_at IS NULL"
+  cur.execute(
+    f"""
+    SELECT id, score, vehicle_type, edge_density, continuity
+    FROM results
+    {deleted_sql}
+    """
+  )
+  rows = cur.fetchall()
+
+  updated = 0
+  skipped = 0
+  for row in rows:
+    score = row["score"]
+    if score is None:
+      skipped += 1
+      continue
+    try:
+      score_f = float(score)
+    except Exception:
+      skipped += 1
+      continue
+
+    depth_mm = float(score_to_depth_mm(score_f, calib=calib))
+    base_verdict = _tread_verdict_from_depth(cfg, depth_mm, row["vehicle_type"])
+    groove_proxy = estimate_groove_channel_frac(
+      score=score_f,
+      edge_density=row["edge_density"],
+      continuity=row["continuity"],
+    )
+    tread_verdict = apply_defect_guard(
+      base_verdict,
+      groove_channel_frac=groove_proxy,
+      quality_ok=True,
+      score=score_f,
+      **_defect_guard_kwargs(cfg),
+    )
+
+    cur.execute(
+      """
+      UPDATE results
+      SET device_depth_mm = ?, raw_score_verdict = ?, tread_verdict = ?, verdict = ?
+      WHERE id = ?
+      """,
+      (depth_mm, tread_verdict, tread_verdict, tread_verdict, row["id"]),
+    )
+    updated += 1
+
+  con.commit()
+  con.close()
+  return updated, skipped
+
+
+def _auto_fit_score_model_and_refresh(cfg: AppConfig) -> dict[str, Any]:
+  pairs = _load_validation_pairs(cfg, include_deleted=False)
+  fit = _fit_linear_score_model(pairs)
+  if fit is None:
+    return {
+      "updated_model": False,
+      "reason": "insufficient_pairs",
+      "pairs": len(pairs),
+    }
+
+  calib = load_calibration(cfg.calibration_path)
+  calib["score_model"] = {
+    "type": "linear",
+    "slope": fit["slope"],
+    "intercept": fit["intercept"],
+  }
+  save_calibration(cfg.calibration_path, calib)
+
+  updated, skipped = _refresh_derived_metrics_from_calibration(cfg, calib, include_deleted=False)
+  return {
+    "updated_model": True,
+    "pairs": len(pairs),
+    "slope": fit["slope"],
+    "intercept": fit["intercept"],
+    "mae_mm": fit["mae_mm"],
+    "r2": fit["r2"],
+    "refreshed_rows": updated,
+    "skipped_rows": skipped,
   }
 
 
@@ -130,6 +332,7 @@ def health():
 @app.get("/api/tread-policy")
 def tread_policy():
   cfg = _cfg()
+  calib = load_calibration(cfg.calibration_path)
   return _jsonify({
     "legal_min_mm": {
       "car": _legal_min_depth_mm(cfg, "car"),
@@ -158,6 +361,15 @@ def tread_policy():
       "auto_calibration_reference_mm_motorcycle": float(getattr(cfg, "auto_calibration_reference_mm_motorcycle", 85.0)),
       "quick_session_auto_capture": bool(getattr(cfg, "quick_session_auto_capture", True)),
       "quick_session_capture_cooldown_s": float(getattr(cfg, "quick_session_capture_cooldown_s", 1.8)),
+    },
+    "validation_policy": {
+      "max_percent_diff": _validation_max_percent_diff(cfg),
+      "max_abs_error_mm": _validation_max_abs_error_mm(cfg),
+      "require_tread_class_match": True,
+    },
+    "calibration_status": {
+      "score_model_available": has_score_model(calib),
+      "calibration_method": calib.get("method") if isinstance(calib, dict) else None,
     },
   })
 
@@ -191,6 +403,8 @@ def scans(
         include_deleted=include_deleted,
         only_deleted=only_deleted,
     )
+    calib = load_calibration(cfg.calibration_path)
+    rows = [_enrich_row_depth_and_raw_verdict(cfg, r, calib=calib) for r in rows]
     return _jsonify({"items": rows, "limit": limit, "include_deleted": include_deleted, "only_deleted": only_deleted})
 
 
@@ -201,6 +415,8 @@ def scan_detail(ts: str, include_deleted: bool = Query(False)):
     row = get_result_by_ts(cfg, ts, include_deleted=include_deleted)
     if not row:
         raise HTTPException(status_code=404, detail="Scan not found")
+    calib = load_calibration(cfg.calibration_path)
+    row = _enrich_row_depth_and_raw_verdict(cfg, row, calib=calib)
     return _jsonify(row)
 
 
@@ -397,6 +613,25 @@ def export_validation_route():
     return FileResponse(str(p), media_type="text/csv", filename=p.name)
 
 
+@app.post("/api/calibration/refresh-derived")
+def refresh_derived_metrics(include_deleted: bool = Query(False)):
+    """Recompute stored derived scan metrics from current score_model calibration."""
+    cfg = _cfg()
+    calib = load_calibration(cfg.calibration_path)
+    if not has_score_model(calib):
+        raise HTTPException(status_code=400, detail="No score_model found in calibration. Fit and save model first.")
+
+    updated, skipped = _refresh_derived_metrics_from_calibration(cfg, calib, include_deleted=include_deleted)
+
+    return _jsonify({
+      "ok": True,
+      "updated": updated,
+      "skipped": skipped,
+      "include_deleted": include_deleted,
+      "score_model_available": True,
+    })
+
+
 # ---------- Web Dashboard ----------
 @app.post("/api/validation/submit")
 def submit_validation(
@@ -417,7 +652,8 @@ def submit_validation(
 
     device_score = float(row.get("score") or 0.0)
     calib = load_calibration(cfg.calibration_path)
-    device_depth = score_to_depth_mm(device_score, calib=calib)
+    has_model = has_score_model(calib)
+    device_depth = score_to_depth_mm(device_score, calib=calib) if has_model else None
 
     vehicle_type = row.get("vehicle_type")
     groove_proxy = estimate_groove_channel_frac(
@@ -427,22 +663,43 @@ def submit_validation(
     )
     min_mm = _legal_min_depth_mm(cfg, vehicle_type)
     manual_class = _tread_verdict_from_depth(cfg, float(manual_depth), vehicle_type)
-    device_class = _tread_verdict_from_depth(cfg, float(device_depth), vehicle_type)
-    device_class = apply_defect_guard(
-      device_class,
-      groove_channel_frac=groove_proxy,
-      quality_ok=True,
-      score=device_score,
-      **_defect_guard_kwargs(cfg),
-    )
+    if has_model and device_depth is not None:
+      device_class = _tread_verdict_from_depth(cfg, float(device_depth), vehicle_type)
+      device_class = apply_defect_guard(
+        device_class,
+        groove_channel_frac=groove_proxy,
+        quality_ok=True,
+        score=device_score,
+        **_defect_guard_kwargs(cfg),
+      )
+    else:
+      # Provisional class before depth calibration is available.
+      device_class = apply_defect_guard(
+        pass_fail_from_score(
+          device_score,
+          groove_channel_frac=groove_proxy,
+          quality_ok=True,
+          **_defect_guard_kwargs(cfg),
+        ),
+        groove_channel_frac=groove_proxy,
+        quality_ok=True,
+        score=device_score,
+        **_defect_guard_kwargs(cfg),
+      )
     class_match = (manual_class == device_class)
 
-    abs_error = abs(device_depth - manual_depth)
-    percent_diff = (abs_error / manual_depth * 100.0) if manual_depth > 0 else 0.0
+    abs_error = abs(device_depth - manual_depth) if has_model and device_depth is not None else None
+    percent_diff = ((abs_error / manual_depth) * 100.0) if (abs_error is not None and manual_depth > 0) else None
 
-    pass_pct = percent_diff <= 5.0
-    pass_err = abs_error    <= 0.5
-    verdict  = "PASS" if (pass_pct and pass_err and class_match) else "FAIL"
+    val_pct_max = _validation_max_percent_diff(cfg)
+    val_abs_max = _validation_max_abs_error_mm(cfg)
+
+    if percent_diff is None or abs_error is None:
+      verdict = "PENDING"
+    else:
+      pass_pct = percent_diff <= val_pct_max
+      pass_err = abs_error <= val_abs_max
+      verdict = "PASS" if (pass_pct and pass_err and class_match) else "FAIL"
 
     from .storage import insert_validation_result
     insert_validation_result(cfg, {
@@ -458,9 +715,13 @@ def submit_validation(
         "notes": (
           f"Submitted via web dashboard | scan_ts={scan_ts} | vehicle_type={vehicle_type} | "
           f"legal_min={min_mm:.1f}mm | manual_class={manual_class} | device_class={device_class} | "
-          f"class_match={class_match} | groove_proxy={groove_proxy if groove_proxy is not None else 'n/a'}"
+          f"score_model_available={has_model} | "
+          f"class_match={class_match} | max_pct_diff={val_pct_max:.2f} | max_abs_err_mm={val_abs_max:.3f} | "
+          f"groove_proxy={groove_proxy if groove_proxy is not None else 'n/a'}"
         ),
     })
+
+    auto_fit = _auto_fit_score_model_and_refresh(cfg)
 
     return JSONResponse(content=_jsonify({
         "ok": True,
@@ -475,6 +736,10 @@ def submit_validation(
         "device_class": device_class,
         "groove_channel_proxy": groove_proxy,
         "class_match": class_match,
+        "score_model_available": has_model,
+        "validation_max_percent_diff": val_pct_max,
+        "validation_max_abs_error_mm": val_abs_max,
+        "auto_score_model": auto_fit,
         "verdict": verdict,
     }))
 
@@ -487,6 +752,10 @@ def index():
     car_warn_mm = _warning_band_mm(cfg, "car")
     moto_min_mm = _legal_min_depth_mm(cfg, "motorcycle")
     moto_warn_mm = _warning_band_mm(cfg, "motorcycle")
+    val_pct_max = _validation_max_percent_diff(cfg)
+    val_abs_max = _validation_max_abs_error_mm(cfg)
+    val_pct_warn = max(val_pct_max * 2.5, val_pct_max + 5.0)
+    val_abs_warn = max(val_abs_max * 3.0, val_abs_max + 0.5)
     html = """
 <!DOCTYPE html>
 <html lang="en">
@@ -1563,6 +1832,22 @@ def index():
             <div class="info-value" id="selPsiStatus">—</div>
           </div>
           <div class="info-item">
+            <div class="info-label">PSI Delta</div>
+            <div class="info-value" id="selPsiGap">—</div>
+          </div>
+          <div class="info-item">
+            <div class="info-label">Groove Score</div>
+            <div class="info-value" id="selScore">—</div>
+          </div>
+          <div class="info-item">
+            <div class="info-label">Depth Est. (mm)</div>
+            <div class="info-value" id="selDepthEst">—</div>
+          </div>
+          <div class="info-item">
+            <div class="info-label">Raw Score Verdict</div>
+            <div class="info-value" id="selRawVerdict">—</div>
+          </div>
+          <div class="info-item">
             <div class="info-label">Notes</div>
             <div class="info-value" id="selNotes">—</div>
           </div>
@@ -1659,6 +1944,8 @@ def index():
 
             <div class="guide-note">
               Current warning bands in code: Car +__CAR_WARN_MM__ mm and Motorcycle +__MOTO_WARN_MM__ mm above the legal minimum before the verdict changes from WARNING to GOOD.
+              Validation pass gate: % diff ≤ __VAL_PCT_MAX__% and abs error ≤ __VAL_ABS_MAX__ mm with class_match=True.
+              Millimeter validation requires a calibrated score_model.
             </div>
           </div>
 
@@ -1720,6 +2007,7 @@ def index():
               <th>% Diff</th>
               <th>Error (mm)</th>
               <th>Time (s)</th>
+              <th>Tread Class</th>
               <th>Verdict</th>
               <th>Notes</th>
               <th>Actions</th>
@@ -1750,6 +2038,17 @@ def index():
               <div style="font-size:0.75rem; color:var(--gray-600); font-weight:600;">OVERALL</div>
               <div id="valOverall" style="font-size:1.4rem; font-weight:800;">—</div>
             </div>
+            <div>
+              <div style="font-size:0.75rem; color:var(--gray-600); font-weight:600;">CLASS MATCH</div>
+              <div id="valClassMatch" style="font-size:1.4rem; font-weight:800; color:#7c3aed;">—</div>
+            </div>
+            <div>
+              <div style="font-size:0.75rem; color:var(--gray-600); font-weight:600;">AVG ERROR (mm)</div>
+              <div id="valAvgErr" style="font-size:1.4rem; font-weight:800; color:#d97706;">—</div>
+            </div>
+          </div>
+          <div style="font-size:0.7rem; color:#9ca3af; text-align:center; margin-top:0.6rem; border-top:1px solid #e9ecef; padding-top:0.5rem;">
+            ✓ <strong>PASS criteria:</strong> % diff ≤ __VAL_PCT_MAX__% &amp;&amp; error ≤ __VAL_ABS_MAX__ mm &amp;&amp; tread class matches manual gauge
           </div>
         </div>
       </div>
@@ -1767,6 +2066,10 @@ def index():
 
   <script>
     const $ = (id) => document.getElementById(id);
+    const VAL_PCT_PASS_MAX = __VAL_PCT_MAX__;
+    const VAL_ABS_PASS_MAX = __VAL_ABS_MAX__;
+    const VAL_PCT_WARN_MAX = __VAL_PCT_WARN__;
+    const VAL_ABS_WARN_MAX = __VAL_ABS_WARN__;
     const status = (t) => {
       $("status").textContent = t;
       $("status").parentElement.classList.remove('fade-in');
@@ -1781,6 +2084,7 @@ def index():
       if (v === "WARNING" || v.includes("WARN")) return "verdict-warning";
       if (v === "REPLACE") return "verdict-replace";
       if (v === "PASS") return "verdict-pass";
+      if (v === "PENDING") return "verdict-warning";
       if (v === "FAIL") return "verdict-fail";
       return "verdict-fail";
     }
@@ -2044,6 +2348,10 @@ def index():
           $("selTs").textContent = "Select a scan from the list";
           $("selVerdict").textContent = "—";
           $("selQualityVerdict").textContent = "—";
+          $("selPsiGap").textContent = "—";
+          $("selScore").textContent = "—";
+          $("selDepthEst").textContent = "—";
+          $("selRawVerdict").textContent = "—";
         }
         await loadScans();
         await loadValidation();
@@ -2105,6 +2413,10 @@ def index():
           $("selTs").textContent = "Select a scan from the list";
           $("selVerdict").textContent = "—";
           $("selQualityVerdict").textContent = "—";
+          $("selPsiGap").textContent = "—";
+          $("selScore").textContent = "—";
+          $("selDepthEst").textContent = "—";
+          $("selRawVerdict").textContent = "—";
         }
         await loadScans();
         await loadValidation();
@@ -2193,6 +2505,22 @@ def index():
         $("selPsiRecommended").textContent = psiRecommended;
         $("selPsiStatus").innerHTML = `<span class="verdict-badge ${verdictClass(psiStatus)}">${psiStatus}</span>`;
 
+        // PSI Delta — red when critically low, amber when slightly low, green OK
+        if (typeof row.psi_measured === "number" && typeof row.psi_recommended === "number") {
+          const gap = row.psi_measured - row.psi_recommended;
+          const gapClr = gap < -4 ? "#dc2626" : gap < 0 ? "#d97706" : "#16a34a";
+          $("selPsiGap").innerHTML = `<span style="color:${gapClr};font-weight:700;">${gap >= 0 ? "+" : ""}${gap.toFixed(1)} PSI</span>`;
+        } else {
+          $("selPsiGap").textContent = "—";
+        }
+        // Groove score, estimated depth, and raw verdict before PSI override
+        $("selScore").textContent = typeof row.score === "number" ? row.score.toFixed(4) : "—";
+        $("selDepthEst").textContent = typeof row.device_depth_mm === "number"
+          ? row.device_depth_mm.toFixed(2) + " mm"
+          : "—";
+        const rawVerdict = row.raw_score_verdict || "";
+        $("selRawVerdict").innerHTML = rawVerdict ? `<span class="verdict-badge ${verdictClass(rawVerdict)}">${rawVerdict}</span>` : "—";
+
         $("selNotes").textContent = row.notes || row["notes"] || "—";
         $("selMmPerPx").textContent = nfmt(row.mm_per_px, 6);
 
@@ -2265,7 +2593,7 @@ def index():
         if (items.length === 0) {
           tbody.innerHTML = `
             <tr>
-              <td colspan="11" style="text-align: center; padding: 2rem; color: #6c757d;">
+              <td colspan="12" style="text-align: center; padding: 2rem; color: #6c757d;">
                 ${recycleMode() ? 'Validation recycle bin is empty' : 'No validation results found'}
               </td>
             </tr>
@@ -2285,6 +2613,29 @@ def index():
             const verd         = row.verdict || "—";
             const notes        = row.notes || "—";
 
+            // Tread class from notes: manual_class=X device_class=Y class_match=Z
+            const classM = notes.match(/manual_class=(\\w+).*?device_class=(\\w+).*?class_match=(\\w+)/);
+            const treadClassHtml = classM ? (() => {
+              const mc = classM[1], dc = classM[2], matched = classM[3].toLowerCase() === "true";
+              const clr = matched ? "#16a34a" : "#dc2626";
+              return `<span style="font-size:0.75rem;font-weight:700;color:${clr};" title="manual=${mc} device=${dc}">${mc}&thinsp;/&thinsp;${dc}</span>`;
+            })() : "—";
+
+            // Color-code % diff using configured validation thresholds
+            const pctNum = percentDiff === "—" ? null : parseFloat(percentDiff);
+            const pctClr = pctNum === null ? "" : pctNum <= VAL_PCT_PASS_MAX ? "color:#16a34a;font-weight:700;" : pctNum <= VAL_PCT_WARN_MAX ? "color:#d97706;font-weight:700;" : "color:#dc2626;font-weight:700;";
+
+            // Color-code abs error using configured validation thresholds
+            const errNum = absErr === "—" ? null : parseFloat(absErr);
+            const errClr = errNum === null ? "" : errNum <= VAL_ABS_PASS_MAX ? "color:#16a34a;font-weight:700;" : errNum <= VAL_ABS_WARN_MAX ? "color:#d97706;font-weight:700;" : "color:#dc2626;font-weight:700;";
+
+            // Fail-reason tooltip
+            const failReasons = [];
+            if (pctNum !== null && pctNum > VAL_PCT_PASS_MAX)   failReasons.push(`%diff ${percentDiff}% > ${VAL_PCT_PASS_MAX.toFixed(1)}%`);
+            if (errNum !== null && errNum > VAL_ABS_PASS_MAX)  failReasons.push(`error ${absErr} mm > ${VAL_ABS_PASS_MAX.toFixed(3)} mm`);
+            if (notes.includes("class_match=False")) failReasons.push("tread class mismatch");
+            const failTip = failReasons.length ? ` title="FAIL: ${failReasons.join(" | ")}"` : "";
+
             const actionCell = recycleMode()
               ? `<td>
                   <button class="btn btn-outline btn-restore-val" data-id="${rowId}" style="padding:0.35rem 0.55rem;"><i class="fas fa-rotate-left"></i></button>
@@ -2298,10 +2649,11 @@ def index():
               <td><strong>${tireId}</strong></td>
               <td>${manualDepth}</td>
               <td>${deviceDepth}</td>
-              <td>${percentDiff === "—" ? "—" : percentDiff + "%"}</td>
-              <td>${absErr}</td>
+              <td><span style="${pctClr}">${percentDiff === "—" ? "—" : percentDiff + "%"}</span></td>
+              <td><span style="${errClr}">${absErr}</span></td>
               <td>${procTime}</td>
-              <td><span class="verdict-badge ${verdictClass(verd)}">${verd}</span></td>
+              <td>${treadClassHtml}</td>
+              <td${failTip}><span class="verdict-badge ${verdictClass(verd)}">${verd}</span>${failReasons.length ? ' <span style="color:#dc2626;font-size:0.7rem;cursor:help;">⚠</span>' : ""}</td>
               <td style="font-size:0.75rem; color:#6c757d; max-width:180px; white-space:normal;">${notes}</td>
               ${actionCell}
             `;
@@ -2327,18 +2679,42 @@ def index():
             });
           });
 
-          // Summary stats
-          const avgPct     = (items.reduce((s, r) => s + (r.percent_diff || 0), 0) / items.length).toFixed(2);
-          const maxErr     = Math.max(...items.map(r => r.abs_error_mm || 0)).toFixed(3);
-          const passCount  = items.filter(r => (r.verdict || "").toUpperCase() === "PASS").length;
-          const passRate   = Math.round((passCount / items.length) * 100);
-          const overall    = passCount === items.length ? "✅ ALL PASS" : `${passCount}/${items.length} PASS`;
+          // Summary stats (numeric metrics only from calibrated/evaluable rows)
+          const evalRows = items.filter(r => typeof r.percent_diff === "number" && typeof r.abs_error_mm === "number");
+          const avgPct = evalRows.length
+            ? (evalRows.reduce((s, r) => s + r.percent_diff, 0) / evalRows.length).toFixed(2)
+            : "—";
+          const maxErr = evalRows.length
+            ? Math.max(...evalRows.map(r => r.abs_error_mm)).toFixed(3)
+            : "—";
+          const passCount  = evalRows.filter(r => (r.verdict || "").toUpperCase() === "PASS").length;
+          const passRate   = evalRows.length ? Math.round((passCount / evalRows.length) * 100) : 0;
+          const overall    = evalRows.length ? (passCount === evalRows.length ? "✅ ALL PASS" : `${passCount}/${evalRows.length} PASS`) : "PENDING CALIBRATION";
 
           $("valCount").textContent    = items.length;
-          $("valAvgPct").textContent   = `${avgPct}%`;
+          $("valAvgPct").textContent   = avgPct === "—" ? "—" : `${avgPct}%`;
           $("valMaxErr").textContent   = maxErr;
           $("valPassRate").textContent = `${passRate}%`;
           $("valOverall").textContent  = overall;
+
+          // Class match count
+          const classMatchCount = items.filter(r => (r.notes || "").includes("class_match=True")).length;
+          $("valClassMatch").textContent = `${classMatchCount}/${items.length}`;
+          $("valClassMatch").style.color = classMatchCount === items.length ? "#16a34a"
+            : classMatchCount >= items.length * 0.75 ? "#d97706" : "#dc2626";
+
+          // Avg abs error
+          const avgErr = evalRows.length
+            ? (evalRows.reduce((s, r) => s + r.abs_error_mm, 0) / evalRows.length).toFixed(3)
+            : "—";
+          $("valAvgErr").textContent = avgErr === "—" ? "—" : (avgErr + " mm");
+
+          // Color avg % diff based on configured threshold
+          const avgPctNum = parseFloat(avgPct);
+          $("valAvgPct").style.color = Number.isFinite(avgPctNum)
+            ? (avgPctNum <= VAL_PCT_PASS_MAX ? "#16a34a" : avgPctNum <= VAL_PCT_WARN_MAX ? "#d97706" : "#dc2626")
+            : "#6c757d";
+
           $("valSummary").style.display = "block";
         }
 
@@ -2506,16 +2882,20 @@ def index():
         if (!res.ok) throw new Error(data.detail || "Submission failed");
 
         const isPass = data.verdict === "PASS";
+        const isPending = data.verdict === "PENDING";
+        const depthTxt = (typeof data.device_depth === "number") ? `${data.device_depth.toFixed(2)} mm` : "—";
+        const errTxt = (typeof data.abs_error_mm === "number") ? `${data.abs_error_mm.toFixed(3)} mm` : "—";
+        const pctTxt = (typeof data.percent_diff === "number") ? `${data.percent_diff.toFixed(2)}%` : "—";
         resultDiv.style.display = "block";
-        resultDiv.style.background = isPass ? "#d1fae5" : "#fee2e2";
-        resultDiv.style.color = isPass ? "#065f46" : "#991b1b";
+        resultDiv.style.background = isPass ? "#d1fae5" : (isPending ? "#fff3cd" : "#fee2e2");
+        resultDiv.style.color = isPass ? "#065f46" : (isPending ? "#856404" : "#991b1b");
         resultDiv.innerHTML = `
-          ${isPass ? "✅" : "❌"} <strong>${data.verdict}</strong> &nbsp;|&nbsp;
+          ${isPass ? "✅" : (isPending ? "⏳" : "❌")} <strong>${data.verdict}</strong> &nbsp;|&nbsp;
           Tire: <strong>${data.tire_id}</strong> &nbsp;|&nbsp;
           Manual: <strong>${data.manual_depth.toFixed(2)} mm</strong> &nbsp;|&nbsp;
-          Device: <strong>${data.device_depth.toFixed(2)} mm</strong> &nbsp;|&nbsp;
-          Error: <strong>${data.abs_error_mm.toFixed(3)} mm</strong> &nbsp;|&nbsp;
-          % Diff: <strong>${data.percent_diff.toFixed(2)}%</strong>
+          Device: <strong>${depthTxt}</strong> &nbsp;|&nbsp;
+          Error: <strong>${errTxt}</strong> &nbsp;|&nbsp;
+          % Diff: <strong>${pctTxt}</strong>
         `;
 
         $("valTireIdInput").value = "";
@@ -2578,6 +2958,10 @@ def index():
         .replace("__MOTO_MIN_MM__", f"{moto_min_mm:.1f}")
         .replace("__MOTO_WARN_MM__", f"{moto_warn_mm:.1f}")
         .replace("__MOTO_WARN_UPPER_MM__", f"{(moto_min_mm + moto_warn_mm):.1f}")
+        .replace("__VAL_PCT_MAX__", f"{val_pct_max:.1f}")
+        .replace("__VAL_ABS_MAX__", f"{val_abs_max:.3f}")
+        .replace("__VAL_PCT_WARN__", f"{val_pct_warn:.1f}")
+        .replace("__VAL_ABS_WARN__", f"{val_abs_warn:.3f}")
     )
     return HTMLResponse(html)
 
