@@ -53,6 +53,7 @@ REQUIRED_SCRIPTS=(
   "${SCRIPTS_DIR}/rpi_kiosk_autostart.sh"
   "${SCRIPTS_DIR}/rpi_desktop_launcher.sh"
   "${SCRIPTS_DIR}/rpi_reset_data.sh"
+  "${SCRIPTS_DIR}/rpi_fix_db_path.sh"
 )
 
 for s in "${REQUIRED_SCRIPTS[@]}"; do
