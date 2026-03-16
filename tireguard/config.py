@@ -70,6 +70,24 @@ class AppConfig:
     recycle_retention_days: int = 30
 
     def __post_init__(self):
+        # Ensure all default paths are rooted at the project directory, not the
+        # current working directory. This prevents "missing data" issues when
+        # launching app.py from SSH/systemd/autostart with a different cwd.
+        project_root = Path(__file__).resolve().parents[1]
+        for key in (
+            "data_dir",
+            "captures_dir",
+            "processed_dir",
+            "db_path",
+            "roi_path",
+            "export_csv_path",
+            "calibration_path",
+            "settings_path",
+        ):
+            p = Path(getattr(self, key))
+            if not p.is_absolute():
+                setattr(self, key, project_root / p)
+
         # normalize clahe_grid
         cg = getattr(self, "clahe_grid", (8, 8))
         if isinstance(cg, int):
