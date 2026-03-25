@@ -1,6 +1,6 @@
 {
-  "px_per_mm": 4.066666666666666,
-  "mm_per_px": 0.2459016393442623,
+  "px_per_mm": 1.925,
+  "mm_per_px": 0.5194805194805194,
   "method": "auto_two_point_roi",
   "auto_reference_mm": 120.0,
   "score_model": {

@@ -2050,6 +2050,23 @@ def index():
           <div style="font-size:0.7rem; color:#9ca3af; text-align:center; margin-top:0.6rem; border-top:1px solid #e9ecef; padding-top:0.5rem;">
             ✓ <strong>PASS criteria:</strong> % diff ≤ __VAL_PCT_MAX__% &amp;&amp; error ≤ __VAL_ABS_MAX__ mm &amp;&amp; tread class matches manual gauge
           </div>
+
+          <div style="margin-top:1rem; border-top:1px solid #e5e7eb; padding-top:0.8rem;">
+            <div style="font-size:0.9rem; font-weight:700; color:#334155; margin-bottom:0.5rem;">
+              Thesis Summary Table
+            </div>
+            <table id="thesisSummaryTable" style="width:100%; border-collapse:collapse; background:white; border:1px solid #e5e7eb; border-radius:10px; overflow:hidden;">
+              <thead>
+                <tr style="background:#f1f5f9;">
+                  <th style="text-align:left; padding:0.55rem; font-size:0.78rem; color:#475569;">Metric</th>
+                  <th style="text-align:left; padding:0.55rem; font-size:0.78rem; color:#475569;">Value</th>
+                  <th style="text-align:left; padding:0.55rem; font-size:0.78rem; color:#475569;">Target</th>
+                  <th style="text-align:left; padding:0.55rem; font-size:0.78rem; color:#475569;">Status</th>
+                </tr>
+              </thead>
+              <tbody id="thesisSummaryBody"></tbody>
+            </table>
+          </div>
         </div>
       </div>
     </div>
@@ -2576,6 +2593,31 @@ def index():
       status("Loading validation data...");
       const tireId = $("fValTire").value.trim() || undefined;
       const verdict = $("fValVerdict").value.trim() || undefined;
+
+      const parseValidationClasses = (notes) => {
+        const text = String(notes || "");
+        let m = text.match(/manual_class=(\\w+).*?device_class=(\\w+)/i);
+        if (m) return { manual: String(m[1]).toUpperCase(), device: String(m[2]).toUpperCase() };
+        m = text.match(/Manual\\s*Class:\\s*(\\w+).*?Device\\s*Class:\\s*(\\w+)/i);
+        if (m) return { manual: String(m[1]).toUpperCase(), device: String(m[2]).toUpperCase() };
+        return null;
+      };
+
+      const statusChip = (ok, na = false) => {
+        if (na) return '<span style="font-size:0.72rem; font-weight:700; color:#64748b;">N/A</span>';
+        const color = ok ? "#16a34a" : "#dc2626";
+        const label = ok ? "PASS" : "CHECK";
+        return `<span style="font-size:0.72rem; font-weight:700; color:${color};">${label}</span>`;
+      };
+
+      const thesisRow = (metric, value, target, statusHtml) => `
+        <tr>
+          <td style="padding:0.5rem 0.55rem; border-top:1px solid #f1f5f9; font-size:0.8rem; color:#0f172a;">${metric}</td>
+          <td style="padding:0.5rem 0.55rem; border-top:1px solid #f1f5f9; font-size:0.8rem; color:#1f2937;">${value}</td>
+          <td style="padding:0.5rem 0.55rem; border-top:1px solid #f1f5f9; font-size:0.8rem; color:#475569;">${target}</td>
+          <td style="padding:0.5rem 0.55rem; border-top:1px solid #f1f5f9;">${statusHtml}</td>
+        </tr>
+      `;
       
       try {
         const query = new URLSearchParams();
@@ -2599,6 +2641,7 @@ def index():
             </tr>
           `;
           $("valSummary").style.display = "none";
+          $("thesisSummaryBody").innerHTML = "";
         } else {
           items.forEach((row) => {
             const tr = document.createElement("tr");
@@ -2714,6 +2757,32 @@ def index():
           $("valAvgPct").style.color = Number.isFinite(avgPctNum)
             ? (avgPctNum <= VAL_PCT_PASS_MAX ? "#16a34a" : avgPctNum <= VAL_PCT_WARN_MAX ? "#d97706" : "#dc2626")
             : "#6c757d";
+
+          // Thesis summary table for panel-ready reporting.
+          const classPairs = items
+            .map(r => parseValidationClasses(r.notes))
+            .filter(Boolean);
+
+          const replaceTP = classPairs.filter(p => p.manual === "REPLACE" && p.device === "REPLACE").length;
+          const replaceFP = classPairs.filter(p => p.manual !== "REPLACE" && p.device === "REPLACE").length;
+          const replaceFN = classPairs.filter(p => p.manual === "REPLACE" && p.device !== "REPLACE").length;
+          const replacePrecision = (replaceTP + replaceFP) > 0 ? (replaceTP / (replaceTP + replaceFP)) : null;
+          const replaceRecall = (replaceTP + replaceFN) > 0 ? (replaceTP / (replaceTP + replaceFN)) : null;
+
+          const classMatchRate = items.length > 0 ? (classMatchCount / items.length) : 0;
+          const passRate01 = evalRows.length > 0 ? (passCount / evalRows.length) : 0;
+
+          const thesisRows = [
+            thesisRow("Total Validation Trials", `${items.length}`, ">= 1", statusChip(items.length >= 1)),
+            thesisRow("Evaluable Trials (with depth/error)", `${evalRows.length}`, ">= 1", statusChip(evalRows.length >= 1)),
+            thesisRow("Average % Difference", avgPct === "—" ? "—" : `${avgPct}%`, `<= ${VAL_PCT_PASS_MAX.toFixed(1)}%`, statusChip(Number.isFinite(avgPctNum) ? (avgPctNum <= VAL_PCT_PASS_MAX) : false, !Number.isFinite(avgPctNum))),
+            thesisRow("Maximum Absolute Error", maxErr === "—" ? "—" : `${maxErr} mm`, `<= ${VAL_ABS_PASS_MAX.toFixed(3)} mm`, statusChip(maxErr !== "—" ? (parseFloat(maxErr) <= VAL_ABS_PASS_MAX) : false, maxErr === "—")),
+            thesisRow("Tread Class Match Rate", `${(classMatchRate * 100).toFixed(1)}% (${classMatchCount}/${items.length})`, "100% ideal", statusChip(classMatchRate >= 0.80)),
+            thesisRow("Validation PASS Rate", `${(passRate01 * 100).toFixed(1)}% (${passCount}/${evalRows.length})`, "As high as possible", statusChip(passRate01 >= 0.80, evalRows.length === 0)),
+            thesisRow("REPLACE Precision", replacePrecision === null ? "—" : `${(replacePrecision * 100).toFixed(1)}%`, "High precision", statusChip(replacePrecision !== null ? replacePrecision >= 0.80 : false, replacePrecision === null)),
+            thesisRow("REPLACE Recall", replaceRecall === null ? "—" : `${(replaceRecall * 100).toFixed(1)}%`, "High recall", statusChip(replaceRecall !== null ? replaceRecall >= 0.80 : false, replaceRecall === null)),
+          ];
+          $("thesisSummaryBody").innerHTML = thesisRows.join("");
 
           $("valSummary").style.display = "block";
         }
