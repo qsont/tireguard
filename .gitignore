@@ -17,4 +17,4 @@ __pycache__/
 data/captures/*
 !data/captures/.gitkeep
 data/processed/*
-!data/processed/.gitkeep
+!data/processed/.gitkeepdata/results.db
