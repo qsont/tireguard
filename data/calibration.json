@@ -1,11 +1,11 @@
 {
-  "px_per_mm": 0.26666666666666666,
-  "mm_per_px": 3.75,
+  "px_per_mm": 0.7647058823529411,
+  "mm_per_px": 1.3076923076923077,
   "method": "auto_two_point_roi",
-  "auto_reference_mm": 120.0,
+  "auto_reference_mm": 85.0,
   "score_model": {
     "type": "linear",
-    "slope": 2.4622124239388326,
-    "intercept": 3.3565869787927936
+    "slope": -2.1171795608810324,
+    "intercept": 3.1985837016177205
   }
 }
