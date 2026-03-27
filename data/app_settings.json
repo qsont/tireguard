@@ -1,8 +1,8 @@
 {
   "car_legal_min_depth_mm": 1.6,
   "motorcycle_legal_min_depth_mm": 1.0,
-  "car_warning_band_mm": 0.4,
-  "motorcycle_warning_band_mm": 0.4,
+  "car_warning_band_mm": 1.6,
+  "motorcycle_warning_band_mm": 1.0,
   "tread_guard_replace_channel_frac": 0.006,
   "tread_guard_warning_channel_frac": 0.018,
   "tread_guard_replace_score": 0.035,
@@ -14,6 +14,10 @@
   "auto_calibration_reference_mm_motorcycle": 85.0,
   "quick_session_auto_capture": false,
   "quick_session_capture_cooldown_s": 1.8,
+  "quality_relaxed_min_sharpness": 24.0,
+  "quality_relaxed_strong_score": 0.11,
+  "quality_relaxed_channel_frac": 0.02,
+  "quality_relaxed_tread_confidence": 0.55,
   "validation_max_percent_diff": 10.0,
   "validation_max_abs_error_mm": 0.5,
   "recycle_retention_days": 30
